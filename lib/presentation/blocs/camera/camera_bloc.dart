@@ -25,16 +25,17 @@ class CameraBloc extends Bloc<CameraEvent, CameraState> {
     Emitter<CameraState> emit,
   ) async {
     try {
-      emit(CameraLoading());
-
-      _cameras = await availableCameras();
-
-      if (_cameras.isEmpty) {
-        emit(const CameraError('No cameras found on this device'));
+      if (_controller != null && _controller!.value.isInitialized) {
+        emit(CameraReady(controller: _controller!));
         return;
       }
 
-      // Default to back camera
+      emit(CameraLoading());
+
+      if (_cameras.isEmpty) {
+        _cameras = await availableCameras();
+      }
+
       _currentCameraIndex = _cameras.indexWhere(
         (c) => c.lensDirection == CameraLensDirection.back,
       );
@@ -79,6 +80,13 @@ class CameraBloc extends Bloc<CameraEvent, CameraState> {
 
       final currentState = state;
 
+      // ✅ Pause preview BEFORE capture to reduce buffer pressure
+      try {
+        await _controller!.pausePreview();
+      } catch (e) {
+        print('⚠️ Could not pause preview: $e');
+      }
+
       // Emit capturing state
       if (currentState is CameraReady) {
         emit(CameraCapturing(controller: _controller!));
@@ -87,8 +95,19 @@ class CameraBloc extends Bloc<CameraEvent, CameraState> {
       final XFile file = await _controller!.takePicture();
       final imageFile = File(file.path);
 
+      // ✅ Resume preview AFTER capture
+      try {
+        await _controller!.resumePreview();
+      } catch (e) {
+        print('⚠️ Could not resume preview: $e');
+      }
+
       emit(CameraPhotoCaptured(controller: _controller!, imageFile: imageFile));
     } catch (e) {
+      // Make sure to resume preview even if capture fails
+      try {
+        await _controller?.resumePreview();
+      } catch (_) {}
       emit(CameraError(e.toString()));
     }
   }
@@ -102,10 +121,11 @@ class CameraBloc extends Bloc<CameraEvent, CameraState> {
     emit(CameraInitial());
   }
 
+  /// ✅ Optimized initialization
   Future<void> _initController(CameraDescription camera) async {
     _controller = CameraController(
       camera,
-      ResolutionPreset.high,
+      ResolutionPreset.low, // Low resolution for preview
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.jpeg,
     );

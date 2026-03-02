@@ -127,10 +127,10 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
             _sendToAI(lastUserMsg.content, state.imageFile);
           }
 
-          // Go back to ready state after short delay
-          Future.delayed(const Duration(milliseconds: 500), () {
-            if (mounted) _cameraBloc.add(InitializeCameraEvent());
-          });
+          // // Go back to ready state after short delay
+          // Future.delayed(const Duration(milliseconds: 500), () {
+          //   if (mounted) _cameraBloc.add(InitializeCameraEvent());
+          // });
         }
       },
       builder: (context, state) {
