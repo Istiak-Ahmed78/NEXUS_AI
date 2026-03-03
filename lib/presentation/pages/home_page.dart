@@ -5,7 +5,7 @@ import '../blocs/ai_chat/ai_chat_bloc.dart';
 import '../widgets/chat_bubble.dart';
 import '../widgets/mic_button.dart';
 import '../widgets/listening_indicator.dart';
-import 'camera_page.dart'; // ✅ NEW
+import 'camera_page.dart';
 import '../../../injection_container.dart';
 
 class HomePage extends StatefulWidget {
@@ -19,6 +19,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   late final AnimationController _pulseAnimation;
   late final SpeechBloc _speechBloc;
   late final AIChatBloc _aiChatBloc;
+  bool _hasLoadedHistory = false; // ✅ Prevent duplicate loading
 
   @override
   void initState() {
@@ -31,7 +32,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _speechBloc = sl<SpeechBloc>();
     _aiChatBloc = sl<AIChatBloc>();
 
-    _aiChatBloc.add(LoadChatHistoryEvent());
+    // ✅ Only load history once on app start
+    if (!_hasLoadedHistory) {
+      _hasLoadedHistory = true;
+      _aiChatBloc.add(const LoadChatHistoryEvent());
+    }
   }
 
   @override
@@ -59,21 +64,25 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           backgroundColor: Colors.deepPurple,
           foregroundColor: Colors.white,
           actions: [
-            // ✅ NEW: Camera button
             IconButton(
               icon: const Icon(Icons.camera_alt),
               tooltip: 'AI Camera',
-              onPressed: () {
-                Navigator.push(
+              onPressed: () async {
+                // ✅ Navigate to camera
+                await Navigator.push(
                   context,
                   MaterialPageRoute(builder: (_) => const CameraPage()),
                 );
+                // ✅ Reload history when returning (to show camera messages)
+                if (mounted) {
+                  _aiChatBloc.add(const LoadChatHistoryEvent());
+                }
               },
             ),
             IconButton(
               icon: const Icon(Icons.delete_outline),
               onPressed: () {
-                _aiChatBloc.add(ClearChatHistoryEvent());
+                _aiChatBloc.add(const ClearChatHistoryEvent());
               },
             ),
             IconButton(icon: const Icon(Icons.settings), onPressed: () {}),
@@ -89,6 +98,30 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                       if (state is AIChatLoading) {
                         return const Center(child: CircularProgressIndicator());
                       } else if (state is AIChatLoaded) {
+                        // ✅ Show empty state if no messages
+                        if (state.messages.isEmpty) {
+                          return Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.waving_hand,
+                                  size: 64,
+                                  color: Colors.deepPurple.withOpacity(0.5),
+                                ),
+                                const SizedBox(height: 16),
+                                Text(
+                                  'Tap mic & ask me anything!',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    color: Colors.grey[600],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }
+
                         return ListView.builder(
                           reverse: true,
                           padding: const EdgeInsets.all(16),

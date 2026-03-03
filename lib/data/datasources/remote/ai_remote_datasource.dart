@@ -112,7 +112,6 @@ When asked for the time or date, use the current date and time provided above.
     return _chatSession!;
   }
 
-  /// ✅ Get vision models from API (using full model name, not baseModelId)
   Future<List<String>> _getAvailableVisionModels() async {
     if (_cachedVisionModels != null &&
         _cacheTime != null &&
@@ -136,18 +135,15 @@ When asked for the time or date, use the current date and time provided above.
 
         final visionModels = <String>[];
         for (final model in models) {
-          final name =
-              model['name'] as String; // e.g., "models/gemini-2.5-flash"
+          final name = model['name'] as String;
           final supportedMethods = model['supportedGenerationMethods'] as List?;
 
-          // Check if supports generateContent (vision capability)
           if (supportedMethods != null &&
               supportedMethods.contains('generateContent')) {
-            // Extract model name without "models/" prefix
             final modelName = name.replaceFirst('models/', '');
 
-            // Only add Gemini models (not Gemma, Imagen, Veo, etc.)
-            if (modelName.startsWith('gemini-')) {
+            if (modelName.startsWith('gemini-') &&
+                _isVisionCapable(modelName)) {
               visionModels.add(modelName);
               print('✅ Found vision model: $modelName');
             }
@@ -163,8 +159,9 @@ When asked for the time or date, use the current date and time provided above.
           ];
         }
 
-        // Sort by preference: 2.5 > 2.0 > flash > pro
         visionModels.sort((a, b) {
+          if (a.contains('2.5-flash') && !b.contains('2.5-flash')) return -1;
+          if (!a.contains('2.5-flash') && b.contains('2.5-flash')) return 1;
           if (a.contains('2.5')) return -1;
           if (b.contains('2.5')) return 1;
           if (a.contains('2.0')) return -1;
@@ -187,6 +184,40 @@ When asked for the time or date, use the current date and time provided above.
       print('⚠️ Error fetching models: $e');
       return ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
     }
+  }
+
+  bool _isVisionCapable(String modelName) {
+    if (modelName.contains('-tts')) {
+      print('⏭️ Skipping TTS model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('computer-use')) {
+      print('⏭️ Skipping computer-use model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('robotics')) {
+      print('⏭️ Skipping robotics model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('-lite')) {
+      print('⏭️ Skipping lite model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('-exp') && !modelName.contains('flash-exp')) {
+      print('⏭️ Skipping experimental model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('flash') || modelName.contains('pro')) {
+      return true;
+    }
+
+    print('⏭️ Skipping unknown model type: $modelName');
+    return false;
   }
 
   @override
@@ -289,7 +320,7 @@ When asked for the time or date, use the current date and time provided above.
         }
 
         _modelCooldowns.remove(modelName);
-        print('✅ Vision response from $modelName');
+        print('✅ Vision response from $modelName (${response.length} chars)');
         return response;
       } catch (e) {
         final errorMsg = e.toString();
@@ -315,6 +346,14 @@ When asked for the time or date, use the current date and time provided above.
         }
 
         if (errorMsg.contains('400') || errorMsg.contains('INVALID_ARGUMENT')) {
+          if (errorMsg.contains('modality') ||
+              errorMsg.contains('Image input')) {
+            print('⚠️ $modelName does not support vision, blacklisting...');
+            _modelCooldowns[modelName] = DateTime.now().add(
+              const Duration(days: 7),
+            );
+            continue;
+          }
           return '⚠️ Could not process this image. Please try again with a clearer photo.';
         }
 
@@ -328,6 +367,7 @@ When asked for the time or date, use the current date and time provided above.
     return '⚠️ Vision service temporarily unavailable. Please try again shortly.';
   }
 
+  // ✅ FIXED: Extract ALL parts from response, not just the first one
   Future<String> _callVisionAPIv1beta({
     required String modelName,
     required String prompt,
@@ -351,7 +391,8 @@ When asked for the time or date, use the current date and time provided above.
           ],
         },
       ],
-      'generationConfig': {'temperature': 0.7, 'maxOutputTokens': 1000},
+      // ✅ Increased token limit for longer responses
+      'generationConfig': {'temperature': 0.7, 'maxOutputTokens': 2048},
     };
 
     final response = await http
@@ -369,9 +410,25 @@ When asked for the time or date, use the current date and time provided above.
       if (candidates != null && candidates.isNotEmpty) {
         final content = candidates[0]['content'];
         final parts = content['parts'] as List?;
+
+        // ✅ FIX: Concatenate ALL parts, not just the first one
         if (parts != null && parts.isNotEmpty) {
-          final text = parts[0]['text'];
-          if (text != null) return text as String;
+          final textParts = <String>[];
+
+          for (final part in parts) {
+            final text = part['text'];
+            if (text != null && text is String && text.isNotEmpty) {
+              textParts.add(text);
+            }
+          }
+
+          if (textParts.isNotEmpty) {
+            final fullText = textParts.join('\n');
+            print(
+              '📝 Extracted ${textParts.length} part(s), total ${fullText.length} chars',
+            );
+            return fullText;
+          }
         }
       }
 

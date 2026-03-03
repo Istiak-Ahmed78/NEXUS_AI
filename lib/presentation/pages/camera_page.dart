@@ -5,9 +5,6 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import '../blocs/camera/camera_bloc.dart';
 import '../blocs/speech/speech_bloc.dart';
 import '../blocs/ai_chat/ai_chat_bloc.dart';
-import '../widgets/chat_bubble.dart';
-import '../widgets/mic_button.dart';
-import '../widgets/listening_indicator.dart';
 import '../../domain/entities/message_entity.dart';
 import '../../data/models/message_model.dart';
 import '../../../injection_container.dart';
@@ -25,8 +22,12 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
   late final SpeechBloc _speechBloc;
   late final AIChatBloc _aiChatBloc;
 
-  // Local message list for camera screen
-  final List<MessageEntity> _messages = [];
+  final List<MessageEntity> _localMessages = [];
+
+  // ✅ Store last captured image for follow-ups
+  File? _lastCapturedImage;
+  bool _isVisionModeEnabled = false;
+  String? _pendingVoiceInput;
 
   @override
   void initState() {
@@ -41,7 +42,6 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     _speechBloc = sl<SpeechBloc>();
     _aiChatBloc = sl<AIChatBloc>();
 
-    // Auto-initialize camera when screen opens
     _cameraBloc.add(InitializeCameraEvent());
   }
 
@@ -53,23 +53,59 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     super.dispose();
   }
 
-  /// Called when speech finishes — capture photo + send to AI
+  void _toggleVisionMode() {
+    setState(() {
+      _isVisionModeEnabled = !_isVisionModeEnabled;
+    });
+
+    if (_isVisionModeEnabled) {
+      print('🟢 [Camera] Vision mode ENABLED - will capture NEW image');
+    } else {
+      print(
+        '⚪ [Camera] Vision mode DISABLED - will use last image for follow-ups',
+      );
+    }
+  }
+
   Future<void> _handleVoiceInput(String text) async {
     if (text.isEmpty) return;
 
-    // Add user message to local list
+    print('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    print('🎤 [Camera] Voice input: "$text"');
+    print('📷 [Camera] Vision mode: $_isVisionModeEnabled');
+    print('💾 [Camera] Last image: ${_lastCapturedImage?.path ?? "NONE"}');
+    print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+
     final userMessage = MessageModel.create(
       content: text,
       role: MessageRole.user,
     );
-    setState(() => _messages.add(userMessage));
+    setState(() => _localMessages.add(userMessage));
 
-    // Capture photo automatically
-    _cameraBloc.add(CapturePhotoEvent());
+    if (_isVisionModeEnabled) {
+      // ✅ Capture NEW image
+      print('📸 [Camera] Capturing NEW image for: "$text"');
+      _pendingVoiceInput = text;
+      _cameraBloc.add(CapturePhotoEvent());
+    } else if (_lastCapturedImage != null) {
+      // ✅ Use LAST captured image for follow-up
+      print('🔄 [Camera] Using LAST image for follow-up: "$text"');
+      print('   🖼️  Image: ${_lastCapturedImage!.path}');
+      _sendVisionMessage(text, _lastCapturedImage!);
+    } else {
+      // ⚠️ No image yet - force capture
+      print('⚠️  [Camera] No image captured yet, forcing capture...');
+      _pendingVoiceInput = text;
+      _cameraBloc.add(CapturePhotoEvent());
+    }
   }
 
-  /// After photo is captured, send both to AI
-  Future<void> _sendToAI(String text, File imageFile) async {
+  Future<void> _sendVisionMessage(String text, File imageFile) async {
+    print('\n✅ [Camera] Sending VISION message:');
+    print('   📝 Text: "$text"');
+    print('   🖼️  Image: ${imageFile.path}');
+    print('   📦 Event: SendMessageWithImageEvent\n');
+
     _aiChatBloc.add(
       SendMessageWithImageEvent(
         message: text,
@@ -77,6 +113,17 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
         shouldSpeak: true,
       ),
     );
+
+    // ✅ Store image and reset vision mode
+    if (_isVisionModeEnabled) {
+      setState(() {
+        _lastCapturedImage = imageFile;
+        _isVisionModeEnabled = false;
+        _pendingVoiceInput = null;
+      });
+      print('💾 [Camera] Stored image for follow-ups');
+      print('🔄 [Camera] Vision mode auto-reset to OFF\n');
+    }
   }
 
   @override
@@ -91,16 +138,10 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
         backgroundColor: Colors.black,
         body: Stack(
           children: [
-            // ── Layer 1: Full screen camera preview ──
             _buildCameraPreview(),
-
-            // ── Layer 2: Top bar (back + switch camera) ──
             _buildTopBar(),
-
-            // ── Layer 3: Floating chat bubbles ──
             _buildFloatingChat(),
-
-            // ── Layer 4: Bottom mic area ──
+            _buildVisionToggleButton(),
             _buildBottomMicArea(),
           ],
         ),
@@ -108,29 +149,14 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     );
   }
 
-  // ─────────────────────────────────────────────
-  // CAMERA PREVIEW
-  // ─────────────────────────────────────────────
   Widget _buildCameraPreview() {
     return BlocConsumer<CameraBloc, CameraState>(
       listener: (context, state) {
-        // When photo is captured, send to AI with the last speech text
         if (state is CameraPhotoCaptured) {
-          final lastUserMsg = _messages.isNotEmpty
-              ? _messages.lastWhere(
-                  (m) => m.role == MessageRole.user,
-                  orElse: () => _messages.last,
-                )
-              : null;
-
-          if (lastUserMsg != null) {
-            _sendToAI(lastUserMsg.content, state.imageFile);
+          print('📷 [Camera] Photo captured: ${state.imageFile.path}');
+          if (_pendingVoiceInput != null) {
+            _sendVisionMessage(_pendingVoiceInput!, state.imageFile);
           }
-
-          // // Go back to ready state after short delay
-          // Future.delayed(const Duration(milliseconds: 500), () {
-          //   if (mounted) _cameraBloc.add(InitializeCameraEvent());
-          // });
         }
       },
       builder: (context, state) {
@@ -174,9 +200,6 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     );
   }
 
-  // ─────────────────────────────────────────────
-  // TOP BAR
-  // ─────────────────────────────────────────────
   Widget _buildTopBar() {
     return SafeArea(
       child: Padding(
@@ -184,7 +207,6 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            // Back button
             _glassButton(
               icon: Icons.arrow_back,
               onTap: () => Navigator.pop(context),
@@ -200,7 +222,6 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
               ),
             ),
 
-            // Switch camera button
             _glassButton(
               icon: Icons.flip_camera_ios,
               onTap: () => _cameraBloc.add(SwitchCameraEvent()),
@@ -226,19 +247,15 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     );
   }
 
-  // ─────────────────────────────────────────────
-  // FLOATING CHAT BUBBLES
-  // ─────────────────────────────────────────────
   Widget _buildFloatingChat() {
     return BlocListener<AIChatBloc, AIChatState>(
       listener: (context, state) {
         if (state is AIChatLoaded && state.messages.isNotEmpty) {
           final lastMsg = state.messages.last;
-          // Only add AI responses to local list
           if (lastMsg.role == MessageRole.assistant) {
-            final alreadyExists = _messages.any((m) => m.id == lastMsg.id);
+            final alreadyExists = _localMessages.any((m) => m.id == lastMsg.id);
             if (!alreadyExists) {
-              setState(() => _messages.add(lastMsg));
+              setState(() => _localMessages.add(lastMsg));
             }
           }
         }
@@ -247,8 +264,8 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
         top: 100,
         left: 0,
         right: 0,
-        bottom: 180,
-        child: _messages.isEmpty
+        bottom: 240,
+        child: _localMessages.isEmpty
             ? Center(
                 child: Container(
                   padding: const EdgeInsets.symmetric(
@@ -259,9 +276,32 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
                     color: Colors.black.withOpacity(0.45),
                     borderRadius: BorderRadius.circular(20),
                   ),
-                  child: const Text(
-                    '📷 Point camera & tap mic to ask AI',
-                    style: TextStyle(color: Colors.white70, fontSize: 14),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _isVisionModeEnabled
+                            ? Icons.camera_alt
+                            : _lastCapturedImage != null
+                            ? Icons.chat_bubble_outline
+                            : Icons.camera_alt_outlined,
+                        color: Colors.white70,
+                        size: 32,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _isVisionModeEnabled
+                            ? '📷 Vision mode ON\nNext message will capture NEW image'
+                            : _lastCapturedImage != null
+                            ? '💬 Follow-up mode\nAsking about previous image'
+                            : '📸 Point camera & tap mic\nto start analyzing',
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
                   ),
                 ),
               )
@@ -271,9 +311,10 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
                   horizontal: 12,
                   vertical: 8,
                 ),
-                itemCount: _messages.length,
+                itemCount: _localMessages.length,
                 itemBuilder: (context, index) {
-                  final message = _messages[_messages.length - 1 - index];
+                  final message =
+                      _localMessages[_localMessages.length - 1 - index];
                   return _buildTransparentBubble(message);
                 },
               ),
@@ -281,7 +322,6 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     );
   }
 
-  /// Semi-transparent version of ChatBubble for camera overlay
   Widget _buildTransparentBubble(MessageEntity message) {
     final isUser = message.role == MessageRole.user;
 
@@ -343,9 +383,80 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     );
   }
 
-  // ─────────────────────────────────────────────
-  // BOTTOM MIC AREA
-  // ─────────────────────────────────────────────
+  Widget _buildVisionToggleButton() {
+    return Positioned(
+      bottom: 160,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: GestureDetector(
+          onTap: _toggleVisionMode,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 300),
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            decoration: BoxDecoration(
+              color: _isVisionModeEnabled
+                  ? Colors.green.withOpacity(0.9)
+                  : _lastCapturedImage != null
+                  ? Colors.blue.withOpacity(0.8)
+                  : Colors.black.withOpacity(0.6),
+              borderRadius: BorderRadius.circular(30),
+              border: Border.all(
+                color: _isVisionModeEnabled
+                    ? Colors.greenAccent
+                    : _lastCapturedImage != null
+                    ? Colors.blueAccent
+                    : Colors.white38,
+                width: 2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color:
+                      (_isVisionModeEnabled
+                              ? Colors.green
+                              : _lastCapturedImage != null
+                              ? Colors.blue
+                              : Colors.black)
+                          .withOpacity(0.5),
+                  blurRadius: 15,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  _isVisionModeEnabled
+                      ? Icons.camera_alt
+                      : _lastCapturedImage != null
+                      ? Icons.image
+                      : Icons.camera_alt_outlined,
+                  color: Colors.white,
+                  size: 24,
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  _isVisionModeEnabled
+                      ? 'Capture NEW'
+                      : _lastCapturedImage != null
+                      ? 'Follow-up Mode'
+                      : 'Vision OFF',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    shadows: [Shadow(blurRadius: 4, color: Colors.black54)],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildBottomMicArea() {
     return Positioned(
       bottom: 0,
@@ -377,16 +488,15 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // AI Thinking indicator
                 BlocBuilder<AIChatBloc, AIChatState>(
                   builder: (context, chatState) {
                     if (chatState is AIChatLoaded && chatState.isTyping) {
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 8),
+                      return const Padding(
+                        padding: EdgeInsets.only(bottom: 8),
                         child: Row(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            const SizedBox(
+                            SizedBox(
                               width: 14,
                               height: 14,
                               child: CircularProgressIndicator(
@@ -394,9 +504,9 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
                                 color: Colors.white70,
                               ),
                             ),
-                            const SizedBox(width: 8),
-                            const Text(
-                              'AI is thinking...',
+                            SizedBox(width: 8),
+                            Text(
+                              'AI is analyzing...',
                               style: TextStyle(
                                 color: Colors.white70,
                                 fontSize: 12,
@@ -410,7 +520,6 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
                   },
                 ),
 
-                // Listening transcript
                 if (isListening && transcript.isNotEmpty)
                   Container(
                     margin: const EdgeInsets.only(bottom: 10),
@@ -434,9 +543,7 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
                     ),
                   ),
 
-                // Mic button
-                MicButton(
-                  isListening: isListening,
+                GestureDetector(
                   onTap: () {
                     if (isListening) {
                       context.read<SpeechBloc>().add(StopListeningEvent());
@@ -444,7 +551,27 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
                       context.read<SpeechBloc>().add(StartListeningEvent());
                     }
                   },
-                  pulseAnimation: _pulseAnimation,
+                  child: Container(
+                    width: 70,
+                    height: 70,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: isListening ? Colors.red : Colors.deepPurple,
+                      boxShadow: [
+                        BoxShadow(
+                          color: (isListening ? Colors.red : Colors.deepPurple)
+                              .withOpacity(0.5),
+                          blurRadius: 20,
+                          spreadRadius: 5,
+                        ),
+                      ],
+                    ),
+                    child: Icon(
+                      isListening ? Icons.stop : Icons.mic,
+                      color: Colors.white,
+                      size: 32,
+                    ),
+                  ),
                 ),
 
                 const SizedBox(height: 8),
@@ -452,8 +579,13 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
                 Text(
                   isListening
                       ? 'Listening... Tap to stop'
-                      : 'Tap mic & ask about what you see',
+                      : _isVisionModeEnabled
+                      ? 'Tap mic to capture & analyze'
+                      : _lastCapturedImage != null
+                      ? 'Tap mic to ask follow-up'
+                      : 'Tap mic to start',
                   style: const TextStyle(color: Colors.white60, fontSize: 12),
+                  textAlign: TextAlign.center,
                 ),
               ],
             ),

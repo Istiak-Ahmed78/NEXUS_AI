@@ -1,4 +1,4 @@
-import 'dart:io'; // ✅ NEW
+import 'dart:io';
 import 'package:dartz/dartz.dart';
 import '../../core/errors/failures.dart';
 import '../../core/usecases/usecase.dart';
@@ -10,23 +10,29 @@ class GetAIResponseUseCase implements UseCase<MessageEntity, String> {
 
   GetAIResponseUseCase(this.repository);
 
-  // ── Text-only call (unchanged) ─────────────────────────────────
+  // ── Text-only call ─────────────────────────────────────────────
   @override
   Future<Either<Failure, MessageEntity>> call(String query) async {
+    print('🔧 [UseCase] call() → Routing to repository.getAIResponse()');
+    print('   📝 Query: "$query"');
     return await repository.getAIResponse(query);
   }
 
-  // ✅ NEW: Image + text call
-  // Used by AIChatBloc when camera captures a photo
+  // ── Image + text call ──────────────────────────────────────────
   Future<Either<Failure, MessageEntity>> callWithImage(
     String query,
     File imageFile,
   ) async {
+    print(
+      '🔧 [UseCase] callWithImage() → Routing to repository.getAIResponseWithImage()',
+    );
+    print('   📝 Query: "$query"');
+    print('   🖼️  Image: ${imageFile.path}');
     return await repository.getAIResponseWithImage(query, imageFile);
   }
 }
 
-// ── GetChatHistoryUseCase (unchanged) ──────────────────────────────
+// ── GetChatHistoryUseCase ──────────────────────────────────────
 class GetChatHistoryUseCase implements UseCase<List<MessageEntity>, NoParams> {
   final AIRepository repository;
 
