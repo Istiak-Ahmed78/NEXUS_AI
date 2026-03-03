@@ -35,41 +35,40 @@ class GeminiModelManager {
     return _models.last;
   }
 
-  // ── Called when a model hits quota limit ──────────
+  // In GeminiModelManager class
   static Future<String> onQuotaExceeded(
     String failedModel,
     int retryAfterSeconds,
   ) async {
+    print('🔍 [DEBUG QUOTA] Model $failedModel exceeded quota');
+    print('🔍 [DEBUG QUOTA] Retry after: $retryAfterSeconds seconds');
+
     final prefs = await SharedPreferences.getInstance();
 
-    // ── Cap unreasonably large retry values ───────────
-    // If retry > 600s (10 min), it likely means the model
-    // is unavailable on this API key — use 6 hour cooldown
     final effectiveCooldown = retryAfterSeconds > 600
         ? 21600 // 6 hours for unavailable models
         : retryAfterSeconds + 5; // +5s buffer for normal quota
 
-    // ── Set cooldown for the failed model ────────────
     final cooldownUntil = DateTime.now()
         .add(Duration(seconds: effectiveCooldown))
         .millisecondsSinceEpoch;
 
     await prefs.setInt('$_cooldownPrefix$failedModel', cooldownUntil);
     print(
-      '🔴 [ModelManager] $failedModel → cooldown for ${effectiveCooldown}s',
+      '🔍 [DEBUG QUOTA] $failedModel → cooldown until ${DateTime.fromMillisecondsSinceEpoch(cooldownUntil)}',
     );
+    print('🔍 [DEBUG QUOTA] Cooldown duration: ${effectiveCooldown}s');
 
-    // ── Find next available model ─────────────────────
+    // Find next available model
     for (final model in _models) {
       if (model != failedModel && !await _isInCooldown(model, prefs)) {
-        print('🔀 [ModelManager] Switching: $failedModel → $model');
+        print('🔍 [DEBUG QUOTA] Switching: $failedModel → $model');
         return model;
       }
     }
 
-    // All models exhausted
-    print('❌ [ModelManager] No available models — all in cooldown');
-    return failedModel; // return same, caller will show error
+    print('🔍 [DEBUG QUOTA] No available models — all in cooldown');
+    return failedModel;
   }
 
   // ── Check if a model is currently in cooldown ─────

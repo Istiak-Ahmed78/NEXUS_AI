@@ -1,8 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:google_generative_ai/google_generative_ai.dart';
-
+import 'package:connectivity_plus/connectivity_plus.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../../core/tools/tool_executor.dart';
 import '../../../core/tools/tool_registry.dart';
@@ -72,7 +75,7 @@ You are a helpful AI voice assistant built into a Flutter app.
 You can perform real device actions like:
 - Checking weather
 - Setting alarms and reminders
-- Making phone calls
+- Making phone calls (by contact name OR direct phone number)
 - Toggling the flashlight
 - Opening web searches
 - Telling the current time and date
@@ -82,6 +85,12 @@ Always respond in a friendly, concise, conversational tone.
 If a tool call succeeds, confirm it naturally to the user.
 If a tool call fails, apologize and explain what went wrong.
 When asked for the time or date, use the current date and time provided above.
+
+When analyzing images:
+- Extract text, numbers, URLs, or other actionable information
+- If you see a phone number in the image and user asks to call it, use the phone_call tool with the number
+- If user mentions a contact name, use make_call tool with the contact name
+- For URLs, use open_web_search tool
 ''';
   }
 
@@ -308,8 +317,8 @@ When asked for the time or date, use the current date and time provided above.
         final imageBytes = await imageFile.readAsBytes();
         print('🖼️  Image loaded: ${imageBytes.lengthInBytes} bytes');
 
-        print('🌐 Calling v1beta API for: $modelName');
-        final response = await _callVisionAPIv1beta(
+        print('🌐 Calling vision API with tools for: $modelName');
+        final response = await _callVisionWithTools(
           modelName: modelName,
           prompt: query,
           imageBytes: imageBytes,
@@ -320,7 +329,7 @@ When asked for the time or date, use the current date and time provided above.
         }
 
         _modelCooldowns.remove(modelName);
-        print('✅ Vision response from $modelName (${response.length} chars)');
+        print('✅ Vision response from $modelName');
         return response;
       } catch (e) {
         final errorMsg = e.toString();
@@ -345,16 +354,15 @@ When asked for the time or date, use the current date and time provided above.
           continue;
         }
 
-        if (errorMsg.contains('400') || errorMsg.contains('INVALID_ARGUMENT')) {
-          if (errorMsg.contains('modality') ||
-              errorMsg.contains('Image input')) {
-            print('⚠️ $modelName does not support vision, blacklisting...');
-            _modelCooldowns[modelName] = DateTime.now().add(
-              const Duration(days: 7),
-            );
-            continue;
-          }
-          return '⚠️ Could not process this image. Please try again with a clearer photo.';
+        if (e.toString().contains('quota') ||
+            e.toString().contains('RESOURCE_EXHAUSTED')) {
+          print('🔍 [DEBUG VISION] ⚠️ This is a QUOTA error');
+          // Parse retry seconds...
+          final retrySeconds = _parseRetrySecondsFromError(e.toString());
+          print('🔍 [DEBUG VISION] Setting cooldown for $retrySeconds seconds');
+          _modelCooldowns[modelName] = DateTime.now().add(
+            Duration(seconds: retrySeconds + 2),
+          );
         }
 
         _modelCooldowns[modelName] = DateTime.now().add(
@@ -367,74 +375,178 @@ When asked for the time or date, use the current date and time provided above.
     return '⚠️ Vision service temporarily unavailable. Please try again shortly.';
   }
 
-  // ✅ FIXED: Extract ALL parts from response, not just the first one
-  Future<String> _callVisionAPIv1beta({
+  Future<String> _callVisionWithTools({
     required String modelName,
     required String prompt,
     required List<int> imageBytes,
   }) async {
-    final apiKey = AppConstants.geminiApiKey;
-    final base64Image = base64Encode(imageBytes);
+    DateTime _toolStartTime = DateTime.now();
+    try {
+      print('🔍 [DEBUG] Starting vision+tool call with model: $modelName');
+      print('🔍 [DEBUG] Prompt length: ${prompt.length} chars');
+      print('🔍 [DEBUG] Image size: ${imageBytes.length} bytes');
 
-    final url = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey',
-    );
+      final model = GenerativeModel(
+        model: modelName,
+        apiKey: AppConstants.geminiApiKey,
+        tools: ToolRegistry.getTools(),
+        systemInstruction: Content.system(_buildSystemPrompt()),
+        generationConfig: GenerationConfig(
+          temperature: 0.7,
+          maxOutputTokens: 2048,
+        ),
+      );
 
-    final requestBody = {
-      'contents': [
-        {
-          'parts': [
-            {'text': prompt},
-            {
-              'inline_data': {'mime_type': 'image/jpeg', 'data': base64Image},
-            },
-          ],
-        },
-      ],
-      // ✅ Increased token limit for longer responses
-      'generationConfig': {'temperature': 0.7, 'maxOutputTokens': 2048},
-    };
+      // Initial request with image
+      final initialContent = [
+        Content.multi([
+          TextPart(prompt),
+          DataPart('image/jpeg', Uint8List.fromList(imageBytes)),
+        ]),
+      ];
 
-    final response = await http
-        .post(
-          url,
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode(requestBody),
-        )
-        .timeout(const Duration(seconds: 30));
+      print('🔍 [DEBUG] Sending initial vision request...');
+      var response = await model.generateContent(initialContent);
+      print('🔍 [DEBUG] Initial response received');
+      print(
+        '🔍 [DEBUG] Has function calls: ${response.functionCalls.isNotEmpty}',
+      );
 
-    if (response.statusCode == 200) {
-      final data = jsonDecode(response.body);
+      int loopCount = 0;
+      const maxLoops = 5;
 
-      final candidates = data['candidates'] as List?;
-      if (candidates != null && candidates.isNotEmpty) {
-        final content = candidates[0]['content'];
-        final parts = content['parts'] as List?;
+      while (response.functionCalls.isNotEmpty && loopCount < maxLoops) {
+        loopCount++;
+        print('🔍 [DEBUG] Tool loop #$loopCount started');
+        print(
+          '🔍 [DEBUG] Function calls count: ${response.functionCalls.length}',
+        );
 
-        // ✅ FIX: Concatenate ALL parts, not just the first one
-        if (parts != null && parts.isNotEmpty) {
-          final textParts = <String>[];
+        final functionResponseParts = <Part>[];
 
-          for (final part in parts) {
-            final text = part['text'];
-            if (text != null && text is String && text.isNotEmpty) {
-              textParts.add(text);
-            }
-          }
+        for (final functionCall in response.functionCalls) {
+          print('🔍 [DEBUG] Executing tool: ${functionCall.name}');
+          print('🔍 [DEBUG] Tool args: ${functionCall.args}');
 
-          if (textParts.isNotEmpty) {
-            final fullText = textParts.join('\n');
+          print(
+            '🔍 [DEBUG TIMING] Starting tool execution at: ${DateTime.now().toIso8601String()}',
+          );
+          final toolResult = await ToolExecutor.execute(
+            functionCall.name,
+            functionCall.args,
+          );
+          print(
+            '🔍 [DEBUG TIMING] Tool execution completed in: ${DateTime.now().difference(_toolStartTime).inMilliseconds}ms',
+          );
+
+          print('🔍 [DEBUG] Tool execution result: $toolResult');
+          print('🔍 [DEBUG] Tool success: ${toolResult['success']}');
+
+          // Add function response as Part
+          functionResponseParts.add(
+            FunctionResponse(functionCall.name, toolResult),
+          );
+        }
+
+        // ⭐ FUNCTION TO WAIT FOR APP TO BE ACTIVE
+        Future<void> ensureAppIsActive() async {
+          // Check current state
+          var currentState = WidgetsBinding.instance.lifecycleState;
+          print('🔍 [DEBUG LIFECYCLE] Current app state: $currentState');
+
+          // If inactive, wait for resume
+          if (currentState == AppLifecycleState.inactive) {
             print(
-              '📝 Extracted ${textParts.length} part(s), total ${fullText.length} chars',
+              '🔍 [DEBUG LIFECYCLE] App is inactive, waiting for resume...',
             );
-            return fullText;
+
+            final completer = Completer<void>();
+            final observer = _AppLifecycleObserver(completer);
+            WidgetsBinding.instance.addObserver(observer);
+
+            try {
+              await completer.future.timeout(
+                const Duration(seconds: 2),
+                onTimeout: () {
+                  print(
+                    '🔍 [DEBUG LIFECYCLE] Timeout waiting for app to resume',
+                  );
+                  if (!completer.isCompleted) {
+                    completer.complete();
+                  }
+                },
+              );
+            } finally {
+              WidgetsBinding.instance.removeObserver(observer);
+            }
+
+            // Check state again after waiting
+            print(
+              '🔍 [DEBUG LIFECYCLE] After wait, app state: ${WidgetsBinding.instance.lifecycleState}',
+            );
           }
+        }
+
+        // After tool execution
+        print('🔍 [DEBUG] Sending function responses back to API...');
+        print(
+          '🔍 [DEBUG] Function response parts count: ${functionResponseParts.length}',
+        );
+
+        try {
+          final connectivityResult = await Connectivity().checkConnectivity();
+          print('🔍 [DEBUG NETWORK] Connectivity: $connectivityResult');
+
+          // ⭐ NEW: Check state - if inactive, DON'T WAIT, just give up
+          final currentState = WidgetsBinding.instance.lifecycleState;
+          print('🔍 [DEBUG LIFECYCLE] Current app state: $currentState');
+
+          if (currentState == AppLifecycleState.inactive) {
+            print(
+              '🔍 [DEBUG LIFECYCLE] App is inactive - CANNOT send function response',
+            );
+            print('🔍 [DEBUG LIFECYCLE] Skipping API call to preserve quota');
+
+            // Return a simple success message without trying API
+            return 'Call initiated successfully!';
+          }
+
+          // Only try API call if app is active
+          print('🔍 [DEBUG LIFECYCLE] App is active, proceeding with API call');
+          response = await model.generateContent([
+            Content.model(functionResponseParts),
+          ]);
+          print('🔍 [DEBUG] Function response accepted by API');
+        } catch (e) {
+          print('🔍 [DEBUG] ❌ ERROR sending function response: $e');
+          print('🔍 [DEBUG] Error type: ${e.runtimeType}');
+          rethrow;
         }
       }
 
-      throw Exception('No text in response');
-    } else {
-      throw Exception('HTTP ${response.statusCode}: ${response.body}');
+      final text = response.text;
+      print('🔍 [DEBUG] Final response text length: ${text?.length ?? 0}');
+
+      if (text == null || text.trim().isEmpty) {
+        return 'Action completed successfully.';
+      }
+
+      return text;
+    } catch (e) {
+      print('🔍 [DEBUG TIMING] ❌ ERROR in vision+tool call: $e');
+      print('🔍 [DEBUG TIMING] Error type: ${e.runtimeType}');
+      print(
+        '🔍 [DEBUG TIMING] Current time: ${DateTime.now().toIso8601String()}',
+      );
+      print(
+        '🔍 [DEBUG TIMING] Time since tool execution started: ${DateTime.now().difference(_toolStartTime).inMilliseconds}ms',
+      );
+
+      // Check if app is in foreground (though Flutter can't directly know this)
+      print(
+        '🔍 [DEBUG TIMING] Widgets binding initialized: ${WidgetsBinding.instance.lifecycleState}',
+      );
+      rethrow;
     }
   }
 
@@ -472,5 +584,21 @@ When asked for the time or date, use the current date and time provided above.
     _chatSession = null;
     _currentModelName = null;
     print('🔄 Chat session reset');
+  }
+}
+
+class _AppLifecycleObserver extends WidgetsBindingObserver {
+  final Completer<void> completer;
+
+  _AppLifecycleObserver(this.completer);
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (!completer.isCompleted) {
+        print('🔍 [DEBUG LIFECYCLE] App resumed, completing waiter');
+        completer.complete();
+      }
+    }
   }
 }
