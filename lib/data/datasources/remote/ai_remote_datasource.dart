@@ -1,3 +1,6 @@
+// lib/data/datasources/remote/ai_remote_datasource.dart
+// ✅ COMPLETE FIXED VERSION - Proper async search handling
+
 import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
@@ -5,7 +8,6 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:google_generative_ai/google_generative_ai.dart';
-import 'package:connectivity_plus/connectivity_plus.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../../core/tools/tool_executor.dart';
 import '../../../core/tools/tool_registry.dart';
@@ -13,7 +15,11 @@ import '../../../core/ai/gemini_model_manager.dart';
 
 abstract class AIRemoteDataSource {
   Future<String> getAIResponse(String query);
-  Future<String> getAIResponseWithImage(String query, File imageFile);
+  Future<String> getAIResponseWithImage(
+    String query,
+    File imageFile, {
+    required Function(String finalResponse) onSearchCompleted,
+  });
   void resetSession();
 }
 
@@ -196,36 +202,13 @@ When analyzing images:
   }
 
   bool _isVisionCapable(String modelName) {
-    if (modelName.contains('-tts')) {
-      print('⏭️ Skipping TTS model: $modelName');
+    if (modelName.contains('-tts')) return false;
+    if (modelName.contains('computer-use')) return false;
+    if (modelName.contains('robotics')) return false;
+    if (modelName.contains('-lite')) return false;
+    if (modelName.contains('-exp') && !modelName.contains('flash-exp'))
       return false;
-    }
-
-    if (modelName.contains('computer-use')) {
-      print('⏭️ Skipping computer-use model: $modelName');
-      return false;
-    }
-
-    if (modelName.contains('robotics')) {
-      print('⏭️ Skipping robotics model: $modelName');
-      return false;
-    }
-
-    if (modelName.contains('-lite')) {
-      print('⏭️ Skipping lite model: $modelName');
-      return false;
-    }
-
-    if (modelName.contains('-exp') && !modelName.contains('flash-exp')) {
-      print('⏭️ Skipping experimental model: $modelName');
-      return false;
-    }
-
-    if (modelName.contains('flash') || modelName.contains('pro')) {
-      return true;
-    }
-
-    print('⏭️ Skipping unknown model type: $modelName');
+    if (modelName.contains('flash') || modelName.contains('pro')) return true;
     return false;
   }
 
@@ -247,10 +230,12 @@ When analyzing images:
           loopCount++;
           for (final functionCall in response.functionCalls) {
             print('🔧 Tool: ${functionCall.name}');
+
             final toolResult = await ToolExecutor.execute(
               functionCall.name,
               functionCall.args,
             );
+
             response = await session.sendMessage(
               Content.functionResponse(functionCall.name, toolResult),
             );
@@ -297,7 +282,11 @@ When analyzing images:
   }
 
   @override
-  Future<String> getAIResponseWithImage(String query, File imageFile) async {
+  Future<String> getAIResponseWithImage(
+    String query,
+    File imageFile, {
+    required Function(String finalResponse) onSearchCompleted,
+  }) async {
     print('📷 Image query: $query');
     print('📁 Image path : ${imageFile.path}');
 
@@ -322,6 +311,7 @@ When analyzing images:
           modelName: modelName,
           prompt: query,
           imageBytes: imageBytes,
+          onSearchCompleted: onSearchCompleted,
         );
 
         if (response.isEmpty) {
@@ -354,17 +344,6 @@ When analyzing images:
           continue;
         }
 
-        if (e.toString().contains('quota') ||
-            e.toString().contains('RESOURCE_EXHAUSTED')) {
-          print('🔍 [DEBUG VISION] ⚠️ This is a QUOTA error');
-          // Parse retry seconds...
-          final retrySeconds = _parseRetrySecondsFromError(e.toString());
-          print('🔍 [DEBUG VISION] Setting cooldown for $retrySeconds seconds');
-          _modelCooldowns[modelName] = DateTime.now().add(
-            Duration(seconds: retrySeconds + 2),
-          );
-        }
-
         _modelCooldowns[modelName] = DateTime.now().add(
           const Duration(minutes: 5),
         );
@@ -375,16 +354,15 @@ When analyzing images:
     return '⚠️ Vision service temporarily unavailable. Please try again shortly.';
   }
 
+  // ✅ UPDATED: _callVisionWithTools with callback parameter
   Future<String> _callVisionWithTools({
     required String modelName,
     required String prompt,
     required List<int> imageBytes,
+    required Function(String finalResponse) onSearchCompleted,
   }) async {
-    DateTime _toolStartTime = DateTime.now();
     try {
-      print('🔍 [DEBUG] Starting vision+tool call with model: $modelName');
-      print('🔍 [DEBUG] Prompt length: ${prompt.length} chars');
-      print('🔍 [DEBUG] Image size: ${imageBytes.length} bytes');
+      print('🔍 [Vision] Starting vision+tool call with model: $modelName');
 
       final model = GenerativeModel(
         model: modelName,
@@ -397,7 +375,6 @@ When analyzing images:
         ),
       );
 
-      // Initial request with image
       final initialContent = [
         Content.multi([
           TextPart(prompt),
@@ -405,11 +382,11 @@ When analyzing images:
         ]),
       ];
 
-      print('🔍 [DEBUG] Sending initial vision request...');
+      print('🔍 [Vision] Sending initial vision request...');
       var response = await model.generateContent(initialContent);
-      print('🔍 [DEBUG] Initial response received');
+      print('🔍 [Vision] Initial response received');
       print(
-        '🔍 [DEBUG] Has function calls: ${response.functionCalls.isNotEmpty}',
+        '🔍 [Vision] Has function calls: ${response.functionCalls.isNotEmpty}',
       );
 
       int loopCount = 0;
@@ -417,115 +394,60 @@ When analyzing images:
 
       while (response.functionCalls.isNotEmpty && loopCount < maxLoops) {
         loopCount++;
-        print('🔍 [DEBUG] Tool loop #$loopCount started');
-        print(
-          '🔍 [DEBUG] Function calls count: ${response.functionCalls.length}',
+        print('🔍 [Vision] Tool loop #$loopCount');
+        print('🔍 [Vision] Function calls: ${response.functionCalls.length}');
+
+        bool hasSearchTool = response.functionCalls.any(
+          (call) => call.name == 'search_web',
         );
 
+        // ✅ IF SEARCH DETECTED - RETURN EARLY AND HANDLE ASYNC
+        if (hasSearchTool) {
+          print('🔍 [Vision] Search tool detected!');
+          print('🔍 [Vision] Returning "Searching..." immediately');
+
+          // Execute search in background
+          _executeVisionSearchAsync(
+            model: model,
+            response: response,
+            onSearchCompleted: onSearchCompleted,
+          );
+
+          // Return early so UI updates immediately
+          return 'Searching the web for that information. Please wait...';
+        }
+
+        // For non-search tools, execute normally
         final functionResponseParts = <Part>[];
 
         for (final functionCall in response.functionCalls) {
-          print('🔍 [DEBUG] Executing tool: ${functionCall.name}');
-          print('🔍 [DEBUG] Tool args: ${functionCall.args}');
+          print('🔍 [Vision] Executing tool: ${functionCall.name}');
 
-          print(
-            '🔍 [DEBUG TIMING] Starting tool execution at: ${DateTime.now().toIso8601String()}',
-          );
           final toolResult = await ToolExecutor.execute(
             functionCall.name,
             functionCall.args,
           );
-          print(
-            '🔍 [DEBUG TIMING] Tool execution completed in: ${DateTime.now().difference(_toolStartTime).inMilliseconds}ms',
-          );
 
-          print('🔍 [DEBUG] Tool execution result: $toolResult');
-          print('🔍 [DEBUG] Tool success: ${toolResult['success']}');
-
-          // Add function response as Part
+          print('🔍 [Vision] Tool result: ${toolResult['success']}');
           functionResponseParts.add(
             FunctionResponse(functionCall.name, toolResult),
           );
         }
 
-        // ⭐ FUNCTION TO WAIT FOR APP TO BE ACTIVE
-        Future<void> ensureAppIsActive() async {
-          // Check current state
-          var currentState = WidgetsBinding.instance.lifecycleState;
-          print('🔍 [DEBUG LIFECYCLE] Current app state: $currentState');
-
-          // If inactive, wait for resume
-          if (currentState == AppLifecycleState.inactive) {
-            print(
-              '🔍 [DEBUG LIFECYCLE] App is inactive, waiting for resume...',
-            );
-
-            final completer = Completer<void>();
-            final observer = _AppLifecycleObserver(completer);
-            WidgetsBinding.instance.addObserver(observer);
-
-            try {
-              await completer.future.timeout(
-                const Duration(seconds: 2),
-                onTimeout: () {
-                  print(
-                    '🔍 [DEBUG LIFECYCLE] Timeout waiting for app to resume',
-                  );
-                  if (!completer.isCompleted) {
-                    completer.complete();
-                  }
-                },
-              );
-            } finally {
-              WidgetsBinding.instance.removeObserver(observer);
-            }
-
-            // Check state again after waiting
-            print(
-              '🔍 [DEBUG LIFECYCLE] After wait, app state: ${WidgetsBinding.instance.lifecycleState}',
-            );
-          }
-        }
-
-        // After tool execution
-        print('🔍 [DEBUG] Sending function responses back to API...');
-        print(
-          '🔍 [DEBUG] Function response parts count: ${functionResponseParts.length}',
-        );
-
+        print('🔍 [Vision] Sending function responses to API...');
         try {
-          final connectivityResult = await Connectivity().checkConnectivity();
-          print('🔍 [DEBUG NETWORK] Connectivity: $connectivityResult');
-
-          // ⭐ NEW: Check state - if inactive, DON'T WAIT, just give up
-          final currentState = WidgetsBinding.instance.lifecycleState;
-          print('🔍 [DEBUG LIFECYCLE] Current app state: $currentState');
-
-          if (currentState == AppLifecycleState.inactive) {
-            print(
-              '🔍 [DEBUG LIFECYCLE] App is inactive - CANNOT send function response',
-            );
-            print('🔍 [DEBUG LIFECYCLE] Skipping API call to preserve quota');
-
-            // Return a simple success message without trying API
-            return 'Call initiated successfully!';
-          }
-
-          // Only try API call if app is active
-          print('🔍 [DEBUG LIFECYCLE] App is active, proceeding with API call');
           response = await model.generateContent([
             Content.model(functionResponseParts),
           ]);
-          print('🔍 [DEBUG] Function response accepted by API');
+          print('🔍 [Vision] Function response accepted');
         } catch (e) {
-          print('🔍 [DEBUG] ❌ ERROR sending function response: $e');
-          print('🔍 [DEBUG] Error type: ${e.runtimeType}');
+          print('🔍 [Vision] ❌ ERROR sending response: $e');
           rethrow;
         }
       }
 
       final text = response.text;
-      print('🔍 [DEBUG] Final response text length: ${text?.length ?? 0}');
+      print('🔍 [Vision] Final response: ${text?.length ?? 0} chars');
 
       if (text == null || text.trim().isEmpty) {
         return 'Action completed successfully.';
@@ -533,20 +455,63 @@ When analyzing images:
 
       return text;
     } catch (e) {
-      print('🔍 [DEBUG TIMING] ❌ ERROR in vision+tool call: $e');
-      print('🔍 [DEBUG TIMING] Error type: ${e.runtimeType}');
+      print('🔍 [Vision] ❌ ERROR: $e');
+      rethrow;
+    }
+  }
+
+  // ✅ NEW: Execute search in background and emit result
+  Future<void> _executeVisionSearchAsync({
+    required GenerativeModel model,
+    required GenerateContentResponse response,
+    required Function(String finalResponse) onSearchCompleted,
+  }) async {
+    print('🔍 [Vision-Async] Starting background search...');
+
+    try {
+      // Execute all search tools
+      final functionResponseParts = <Part>[];
+
+      for (final functionCall in response.functionCalls) {
+        print('🔍 [Vision-Async] Executing: ${functionCall.name}');
+
+        final toolResult = await ToolExecutor.execute(
+          functionCall.name,
+          functionCall.args,
+        );
+
+        print('🔍 [Vision-Async] Tool result received');
+        functionResponseParts.add(
+          FunctionResponse(functionCall.name, toolResult),
+        );
+      }
+
+      print('🔍 [Vision-Async] Sending search results to Gemini...');
+
+      // Send results back to Gemini to generate final response
+      final finalResponse = await model.generateContent([
+        Content.model(functionResponseParts),
+      ]);
+
+      final finalText = finalResponse.text;
       print(
-        '🔍 [DEBUG TIMING] Current time: ${DateTime.now().toIso8601String()}',
-      );
-      print(
-        '🔍 [DEBUG TIMING] Time since tool execution started: ${DateTime.now().difference(_toolStartTime).inMilliseconds}ms',
+        '🔍 [Vision-Async] Final response ready: ${finalText?.length ?? 0} chars',
       );
 
-      // Check if app is in foreground (though Flutter can't directly know this)
-      print(
-        '🔍 [DEBUG TIMING] Widgets binding initialized: ${WidgetsBinding.instance.lifecycleState}',
+      if (finalText != null && finalText.trim().isNotEmpty) {
+        print('🔍 [Vision-Async] Calling callback with final response');
+        onSearchCompleted(finalText);
+      } else {
+        print(
+          '🔍 [Vision-Async] Empty response, calling callback with default',
+        );
+        onSearchCompleted('Search completed. Here\'s what I found.');
+      }
+    } catch (e) {
+      print('🔍 [Vision-Async] ❌ ERROR: $e');
+      onSearchCompleted(
+        'I found information but encountered an error processing it. Please try again.',
       );
-      rethrow;
     }
   }
 
@@ -584,21 +549,5 @@ When analyzing images:
     _chatSession = null;
     _currentModelName = null;
     print('🔄 Chat session reset');
-  }
-}
-
-class _AppLifecycleObserver extends WidgetsBindingObserver {
-  final Completer<void> completer;
-
-  _AppLifecycleObserver(this.completer);
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      if (!completer.isCompleted) {
-        print('🔍 [DEBUG LIFECYCLE] App resumed, completing waiter');
-        completer.complete();
-      }
-    }
   }
 }

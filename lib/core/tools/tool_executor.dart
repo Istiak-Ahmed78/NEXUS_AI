@@ -1,5 +1,6 @@
 // lib/core/tools/tool_executor.dart
 
+import 'dart:async';
 import 'dart:convert';
 import 'package:fl_ai/core/constants/app_constants.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
@@ -11,6 +12,55 @@ import 'package:timezone/data/latest.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:torch_light/torch_light.dart';
 import 'package:url_launcher/url_launcher.dart';
+
+// ═══════════════════════════════════════════════════════════════════
+// 🆕 SEARCH CACHE CLASS
+// ═══════════════════════════════════════════════════════════════════
+class SearchCache {
+  static final Map<String, List<Map<String, dynamic>>> _cache = {};
+  static final Map<String, DateTime> _timestamps = {};
+
+  static const Duration CACHE_DURATION = Duration(hours: 1);
+
+  /// Get cached results if they exist and are fresh
+  static List<Map<String, dynamic>>? get(String query) {
+    if (!_cache.containsKey(query)) {
+      print('📭 [Cache] No cache for: "$query"');
+      return null;
+    }
+
+    final timestamp = _timestamps[query];
+    final age = DateTime.now().difference(timestamp!);
+
+    if (age > CACHE_DURATION) {
+      print('⏰ [Cache] Cache expired for: "$query" (age: ${age.inMinutes}m)');
+      _cache.remove(query);
+      _timestamps.remove(query);
+      return null;
+    }
+
+    print(
+      '✅ [Cache] HIT for: "$query" (${_cache[query]!.length} items, age: ${age.inSeconds}s)',
+    );
+    return _cache[query];
+  }
+
+  /// Store results in cache
+  static void set(String query, List<Map<String, dynamic>> results) {
+    _cache[query] = results;
+    _timestamps[query] = DateTime.now();
+    print('💾 [Cache] STORED: "$query" (${results.length} items)');
+  }
+
+  /// Clear all cache
+  static void clear() {
+    _cache.clear();
+    _timestamps.clear();
+    print('🗑️ [Cache] Cleared all cache');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 
 class ToolExecutor {
   static final FlutterLocalNotificationsPlugin _notifications =
@@ -54,7 +104,7 @@ class ToolExecutor {
       case 'make_call':
         return await _makeCall(args['contact_name'] as String);
 
-      case 'phone_call': // ✅ NEW
+      case 'phone_call':
         return await _phoneCall(args['phone_number'] as String);
 
       case 'toggle_flashlight':
@@ -62,6 +112,9 @@ class ToolExecutor {
 
       case 'open_web_search':
         return await _openWebSearch(args['query'] as String);
+
+      case 'search_web':
+        return await _searchWeb(args['query'] as String);
 
       case 'get_time':
         return _getTime();
@@ -305,7 +358,7 @@ class ToolExecutor {
     }
   }
 
-  // ── 📞 CALL BY PHONE NUMBER ───────────────────────  ✅ NEW
+  // ── 📞 CALL BY PHONE NUMBER ───────────────────────
   static Future<Map<String, dynamic>> _phoneCall(String phoneNumber) async {
     try {
       print('📞 [DirectCall] Calling number: "$phoneNumber"');
@@ -344,10 +397,8 @@ class ToolExecutor {
       print('✅ [DirectCall] Phone permission granted');
 
       // ── Step 2: Clean and validate number ─────────
-      // Remove spaces, dashes, parentheses
       final cleanNumber = phoneNumber.replaceAll(RegExp(r'[\s\-\(\)]'), '');
 
-      // Basic validation (at least 3 digits)
       if (cleanNumber.length < 3) {
         print('❌ [DirectCall] Invalid number: "$phoneNumber"');
         return {
@@ -509,6 +560,136 @@ class ToolExecutor {
     } catch (e) {
       print('❌ [Date] Error: $e');
       return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // 🔍 WEB SEARCH WITH CACHE & TIMEOUT
+  // ═══════════════════════════════════════════════════════════════════
+  static Future<Map<String, dynamic>> _searchWeb(String query) async {
+    try {
+      print('🔍 [Search] Query: "$query"');
+
+      // ✅ STEP 1: Check cache first (INSTANT)
+      final cached = SearchCache.get(query);
+      if (cached != null) {
+        return {
+          'success': true,
+          'query': query,
+          'results': cached,
+          'status': 'cached',
+          'count': cached.length,
+          'message': 'Using cached results',
+        };
+      }
+
+      print('⏳ [Search] Starting Serper API call with 2-second timeout...');
+
+      // ✅ STEP 2: Call Serper API with 2-second timeout
+      List<Map<String, dynamic>> results = [];
+      try {
+        results = await _performWebSearchAsync(query).timeout(
+          const Duration(seconds: 2),
+          onTimeout: () {
+            print(
+              '⏱️ [Search] Serper API timeout (2s) - returning empty results',
+            );
+            return [];
+          },
+        );
+      } catch (e) {
+        print('❌ [Search] Serper API error: $e');
+        results = [];
+      }
+
+      // ✅ STEP 3: Cache the results (even if empty)
+      SearchCache.set(query, results);
+
+      print('✅ [Search] Got ${results.length} results');
+
+      return {
+        'success': true,
+        'query': query,
+        'results': results,
+        'status': 'completed',
+        'count': results.length,
+        'message': 'Search completed',
+      };
+    } catch (e) {
+      print('❌ [Search] Outer error: $e');
+      return {
+        'success': false,
+        'error': e.toString(),
+        'query': query,
+        'status': 'error',
+      };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // 🔍 PERFORM WEB SEARCH (Serper API)
+  // ═══════════════════════════════════════════════════════════════════
+  static Future<List<Map<String, dynamic>>> _performWebSearchAsync(
+    String query,
+  ) async {
+    try {
+      print('🔍 [Search-Async] Starting search for: "$query"');
+
+      final apiKey = AppConstants.serperApiKey;
+      print('✅ [Search-Async] API Key loaded: ${apiKey.substring(0, 10)}...');
+
+      const url = 'https://google.serper.dev/search';
+
+      print('📡 [Search-Async] Sending POST request to: $url');
+
+      final response = await http
+          .post(
+            Uri.parse(url),
+            headers: {'X-API-KEY': apiKey, 'Content-Type': 'application/json'},
+            body: jsonEncode({'q': query}),
+          )
+          .timeout(const Duration(seconds: 2));
+
+      print('📊 [Search-Async] Status code: ${response.statusCode}');
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        print('✅ [Search-Async] Response decoded successfully');
+
+        // Extract organic results
+        final List<dynamic> organic = data['organic'] ?? [];
+        print('📋 [Search-Async] Found ${organic.length} organic results');
+
+        // Format results (take top 5)
+        final results = organic.take(5).map((result) {
+          return {
+            'title': result['title'] ?? 'No title',
+            'link': result['link'] ?? '',
+            'snippet': result['snippet'] ?? 'No description',
+            'date': result['date'] ?? '',
+          };
+        }).toList();
+
+        print('✅ [Search-Async] Formatted ${results.length} results');
+        return results;
+      } else if (response.statusCode == 403) {
+        print('❌ [Search-Async] 403 Forbidden - Invalid API key');
+        print('📝 [Search-Async] Response: ${response.body.substring(0, 200)}');
+        return [];
+      } else if (response.statusCode == 429) {
+        print('⏱️ [Search-Async] 429 Too Many Requests - Rate limited');
+        return [];
+      } else {
+        print('❌ [Search-Async] HTTP ${response.statusCode}');
+        print('📝 [Search-Async] Response: ${response.body.substring(0, 200)}');
+        return [];
+      }
+    } on TimeoutException catch (e) {
+      print('⏱️ [Search-Async] Timeout after 2 seconds: $e');
+      return [];
+    } catch (e) {
+      print('❌ [Search-Async] Exception: $e');
+      return [];
     }
   }
 }

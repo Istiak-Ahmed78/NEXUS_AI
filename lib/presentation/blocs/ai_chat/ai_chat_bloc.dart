@@ -1,3 +1,6 @@
+// lib/presentation/blocs/ai_chat/ai_chat_bloc.dart
+// ✅ COMPLETE FIXED VERSION - With callback handling
+
 import 'dart:io';
 
 import 'package:equatable/equatable.dart';
@@ -5,7 +8,8 @@ import 'package:fl_ai/domain/usecases/clear_chat_history_usecase.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import '../../../core/usecases/usecase.dart';
 import '../../../domain/entities/message_entity.dart';
-import '../../../domain/usecases/get_ai_response_usecase.dart';
+import '../../../domain/usecases/get_ai_response_usecase.dart'
+    hide ClearChatHistoryUseCase;
 import '../../../domain/usecases/speak_text_usecase.dart';
 import '../../../data/models/message_model.dart';
 
@@ -26,6 +30,7 @@ class AIChatBloc extends Bloc<AIChatEvent, AIChatState> {
   }) : super(AIChatInitial()) {
     on<SendMessageEvent>(_onSendMessage);
     on<SendMessageWithImageEvent>(_onSendMessageWithImage);
+    on<VisionSearchCompletedEvent>(_onVisionSearchCompleted);
     on<LoadChatHistoryEvent>(_onLoadChatHistory);
     on<ClearChatHistoryEvent>(_onClearChatHistory);
     on<AddMessageEvent>(_onAddMessage);
@@ -129,6 +134,7 @@ class AIChatBloc extends Bloc<AIChatEvent, AIChatState> {
     );
   }
 
+  // ✅ UPDATED: _onSendMessageWithImage with callback
   Future<void> _onSendMessageWithImage(
     SendMessageWithImageEvent event,
     Emitter<AIChatState> emit,
@@ -156,9 +162,23 @@ class AIChatBloc extends Bloc<AIChatEvent, AIChatState> {
     );
 
     print('   🔄 Calling: getAIResponse.callWithImage() → VISION MODEL');
+
+    // ✅ NEW: Pass callback to handle async search completion
     final result = await getAIResponse.callWithImage(
       event.message,
       event.imageFile,
+      onVisionSearchCompleted: (finalResponse) {
+        print('🎯 [BLoC] Vision search completed callback triggered');
+        print('   📝 Final response: "${_truncateForLog(finalResponse, 100)}"');
+
+        // Emit the new event to update UI
+        add(
+          VisionSearchCompletedEvent(
+            finalResponse: finalResponse,
+            shouldSpeak: event.shouldSpeak,
+          ),
+        );
+      },
     );
 
     result.fold(
@@ -184,6 +204,54 @@ class AIChatBloc extends Bloc<AIChatEvent, AIChatState> {
         }
       },
     );
+  }
+
+  // ✅ Handle vision search completion
+  Future<void> _onVisionSearchCompleted(
+    VisionSearchCompletedEvent event,
+    Emitter<AIChatState> emit,
+  ) async {
+    print('\n🎯 [BLoC] Event: VisionSearchCompletedEvent');
+    print('   📝 Final response: "${_truncateForLog(event.finalResponse)}"\n');
+
+    final currentState = state;
+    if (currentState is! AIChatLoaded) {
+      print('   ⚠️ State is not AIChatLoaded, ignoring event');
+      return;
+    }
+
+    // Replace the "Searching..." message with the final response
+    final messages = currentState.messages;
+    if (messages.isEmpty) return;
+
+    // Find and replace the last AI message (the "Searching..." one)
+    final lastMessageIndex = messages.length - 1;
+    final lastMessage = messages[lastMessageIndex];
+
+    if (lastMessage.role == MessageRole.assistant &&
+        lastMessage.content.contains('Searching')) {
+      // Replace it with the final response
+      final finalMessage = MessageModel.create(
+        content: event.finalResponse,
+        role: MessageRole.assistant,
+      );
+
+      final updatedMessages = [
+        ...messages.sublist(0, lastMessageIndex),
+        finalMessage,
+      ];
+
+      emit(AIChatLoaded(messages: updatedMessages, isTyping: false));
+
+      if (event.shouldSpeak) {
+        final cleanText = _stripMarkdown(event.finalResponse);
+        print(
+          '   🔊 TTS Original: "${_truncateForLog(event.finalResponse, 100)}"',
+        );
+        print('   🔊 TTS Cleaned: "${_truncateForLog(cleanText, 100)}"');
+        speakText(cleanText);
+      }
+    }
   }
 
   Future<void> _onLoadChatHistory(

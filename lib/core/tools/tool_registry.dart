@@ -1,5 +1,3 @@
-// lib/core/tools/tool_registry.dart
-
 import 'package:google_generative_ai/google_generative_ai.dart';
 
 class ToolRegistry {
@@ -7,6 +5,22 @@ class ToolRegistry {
     return [
       Tool(
         functionDeclarations: [
+          // ── 🔎 SEARCH WEB (PRIMARY - INSTANT RETURN) ────  ✅ MOVED TO TOP
+          FunctionDeclaration(
+            'search_web',
+            'Search the web for information and return results instantly to answer questions. Use this to find current information, news, tips, tutorials, and any web content. Results are returned directly to provide answers.',
+            Schema(
+              SchemaType.object,
+              properties: {
+                'query': Schema(
+                  SchemaType.string,
+                  description: 'The search query string',
+                ),
+              },
+              requiredProperties: ['query'],
+            ),
+          ),
+
           // ── 🌤️ WEATHER ──────────────────────────────
           FunctionDeclaration(
             'get_weather',
@@ -59,7 +73,7 @@ class ToolRegistry {
             ),
           ),
 
-          // ── 📞 CALL BY PHONE NUMBER ──────────────────  ✅ NEW
+          // ── 📞 CALL BY PHONE NUMBER ──────────────────
           FunctionDeclaration(
             'phone_call',
             'Make a phone call to a specific phone number directly (not from contacts)',
@@ -89,10 +103,25 @@ class ToolRegistry {
             ),
           ),
 
-          // ── 🌐 WEB SEARCH ────────────────────────────
+          // ── 🕐 TIME ──────────────────────────────────
+          FunctionDeclaration(
+            'get_time',
+            'Get the current time in 12-hour and 24-hour format with timezone',
+            Schema(SchemaType.object, properties: {}, requiredProperties: []),
+          ),
+
+          // ── 📅 DATE ──────────────────────────────────
+          FunctionDeclaration(
+            'get_date',
+            'Get the current date with day of week, month, and year',
+            Schema(SchemaType.object, properties: {}, requiredProperties: []),
+          ),
+
+          // ── 🌐 WEB SEARCH (BROWSER) ──────────────────  ⚠️ DEPRIORITIZED
+          // Only use this if user explicitly asks to "open browser" or "search in browser"
           FunctionDeclaration(
             'open_web_search',
-            'Open a web search for a given query in the browser',
+            'Open a web search in the browser application. Only use this if the user explicitly asks to open a browser or search in a browser. For getting search results to answer questions, use search_web instead.',
             Schema(
               SchemaType.object,
               properties: {

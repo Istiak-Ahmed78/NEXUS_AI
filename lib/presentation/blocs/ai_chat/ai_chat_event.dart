@@ -19,10 +19,6 @@ class SendMessageEvent extends AIChatEvent {
 }
 
 // ✅ NEW: Image + text query ────────────────────────────────────────
-// Triggered by CameraPage after user speaks a query and takes a photo.
-// imageFile  = the captured photo from CameraX
-// message    = the spoken/typed question about the image
-// shouldSpeak = whether TTS should read the AI response aloud
 class SendMessageWithImageEvent extends AIChatEvent {
   final String message;
   final File imageFile;
@@ -36,6 +32,21 @@ class SendMessageWithImageEvent extends AIChatEvent {
 
   @override
   List<Object?> get props => [message, imageFile, shouldSpeak];
+}
+
+// ✅ NEW: Handle async search result from vision
+// Emitted when a vision query completes its background search
+class VisionSearchCompletedEvent extends AIChatEvent {
+  final String finalResponse;
+  final bool shouldSpeak;
+
+  const VisionSearchCompletedEvent({
+    required this.finalResponse,
+    this.shouldSpeak = true,
+  });
+
+  @override
+  List<Object?> get props => [finalResponse, shouldSpeak];
 }
 
 // ── Load chat history (unchanged) ──────────────────────────────────

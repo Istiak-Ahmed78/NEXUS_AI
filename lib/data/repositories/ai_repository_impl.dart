@@ -1,5 +1,8 @@
+// lib/data/repositories/ai_repository_impl.dart
+// ✅ COMPLETE FIXED VERSION - With async search callback
+
 import 'dart:async';
-import 'dart:io'; // ✅ NEW
+import 'dart:io';
 import 'package:dartz/dartz.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:flutter_tts/flutter_tts.dart';
@@ -21,6 +24,9 @@ class AIRepositoryImpl implements AIRepository {
 
   // ── Stream for listening state (unchanged) ─────────────────────
   final _listeningController = StreamController<bool>.broadcast();
+
+  // ✅ NEW: Stream for vision search completion
+  final _visionSearchController = StreamController<String>.broadcast();
 
   AIRepositoryImpl({
     required this.remoteDataSource,
@@ -126,20 +132,38 @@ class AIRepositoryImpl implements AIRepository {
     }
   }
 
-  // ✅ NEW: getAIResponseWithImage ────────────────────────────────
-  // Calls vision datasource, saves AI reply to local cache,
-  // returns MessageEntity to domain layer.
-  // Note: we intentionally do NOT save the image file locally —
-  // only the text content of the conversation is persisted.
+  // ✅ UPDATED: getAIResponseWithImage with callback
   @override
   Future<Either<Failure, MessageEntity>> getAIResponseWithImage(
     String query,
-    File imageFile,
-  ) async {
+    File imageFile, {
+    required Function(String finalResponse) onSearchCompleted,
+  }) async {
     try {
+      print(
+        '📦 [Repository] Calling remoteDataSource.getAIResponseWithImage()',
+      );
+      print('   📝 Query: "$query"');
+      print('   🖼️  Image: ${imageFile.path}');
+
       final aiResponse = await remoteDataSource.getAIResponseWithImage(
         query,
         imageFile,
+        onSearchCompleted: (finalResponse) {
+          print('📦 [Repository] Vision search completed callback received');
+          print(
+            '   📝 Final response: "${finalResponse.substring(0, finalResponse.length > 50 ? 50 : finalResponse.length)}..."',
+          );
+
+          // Save the final response to local database
+          _saveVisionSearchResult(finalResponse);
+
+          // Emit to stream so BLoC can listen
+          _visionSearchController.add(finalResponse);
+
+          // Also call the original callback
+          onSearchCompleted(finalResponse);
+        },
       );
 
       final message = MessageModel.create(
@@ -147,14 +171,33 @@ class AIRepositoryImpl implements AIRepository {
         role: MessageRole.assistant,
       );
 
-      // Save AI reply to local chat history
+      // Save initial "Searching..." message to local chat history
       await localDataSource.saveMessage(message);
 
+      print('📦 [Repository] Returning initial response: "$aiResponse"');
       return Right(message);
     } catch (e) {
+      print('📦 [Repository] ❌ Error: $e');
       return Left(ServerFailure(e.toString()));
     }
   }
+
+  // ✅ NEW: Save vision search result to local database
+  Future<void> _saveVisionSearchResult(String finalResponse) async {
+    try {
+      final message = MessageModel.create(
+        content: finalResponse,
+        role: MessageRole.assistant,
+      );
+      await localDataSource.saveMessage(message);
+      print('💾 [Repository] Vision search result saved to local database');
+    } catch (e) {
+      print('❌ [Repository] Failed to save vision search result: $e');
+    }
+  }
+
+  // ✅ NEW: Stream for listening to vision search completion
+  Stream<String> get visionSearchStream => _visionSearchController.stream;
 
   // ── getChatHistory (unchanged) ─────────────────────────────────
   @override
@@ -182,9 +225,10 @@ class AIRepositoryImpl implements AIRepository {
   @override
   Stream<bool> get listeningStream => _listeningController.stream;
 
-  // ── dispose (unchanged) ────────────────────────────────────────
+  // ── dispose (updated) ──────────────────────────────────────────
   void dispose() {
     _listeningController.close();
+    _visionSearchController.close();
     _tts.stop();
   }
 }

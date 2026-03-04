@@ -2,6 +2,7 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class AppConstants {
   static String get appName => dotenv.env['APP_NAME'] ?? 'FL AI Assistant';
+
   static String get geminiApiKey {
     final key = dotenv.env['GEMINI_API_KEY'];
     if (key == null || key.isEmpty) {
@@ -19,6 +20,20 @@ class AppConstants {
         '   Add: OPENWEATHER_API_KEY=your_key_here',
       );
     }
+    return key;
+  }
+
+  // ✅ Serper API Key (Google Search) ────────────
+  static String get serperApiKey {
+    final key = dotenv.env['SERPER_API_KEY'];
+    if (key == null || key.isEmpty) {
+      throw Exception(
+        '❌ SERPER_API_KEY is missing in .env file.\n'
+        '   Add: SERPER_API_KEY=your_key_here\n'
+        '   Get it from: https://serper.dev',
+      );
+    }
+    print('✅ [AppConstants] Serper API Key loaded: ${key.substring(0, 10)}...');
     return key;
   }
 

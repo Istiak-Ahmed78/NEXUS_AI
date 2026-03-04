@@ -1,3 +1,6 @@
+// lib/main.dart
+// ✅ COMPLETE FIXED VERSION
+
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'injection_container.dart' as di;
@@ -18,10 +21,18 @@ void main() async {
       "✅ API key loaded: ${apiKey.substring(0, 5)}...${apiKey.substring(apiKey.length - 5)}",
     );
   } catch (e) {
-    print("❌ Error: $e");
+    print("❌ Error loading .env: $e");
   }
 
-  await di.init();
+  // ✅ Initialize dependency injection
+  try {
+    await di.init();
+    print("✅ Dependency injection initialized");
+  } catch (e) {
+    print("❌ Error initializing DI: $e");
+    rethrow;
+  }
+
   runApp(const MyApp());
 }
 
