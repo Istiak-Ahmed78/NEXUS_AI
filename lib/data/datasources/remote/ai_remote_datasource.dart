@@ -1,5 +1,5 @@
 // lib/data/datasources/remote/ai_remote_datasource.dart
-// ✅ COMPLETE FIXED VERSION - Proper async search handling
+// ✅ COMPLETE FIXED VERSION - Proper async search handling with timeout & cache
 
 import 'dart:async';
 import 'dart:io';
@@ -12,6 +12,7 @@ import '../../../core/constants/app_constants.dart';
 import '../../../core/tools/tool_executor.dart';
 import '../../../core/tools/tool_registry.dart';
 import '../../../core/ai/gemini_model_manager.dart';
+import '../local/search_cache_datasource.dart';
 
 abstract class AIRemoteDataSource {
   Future<String> getAIResponse(String query);
@@ -26,6 +27,7 @@ abstract class AIRemoteDataSource {
 class AIRemoteDataSourceImpl implements AIRemoteDataSource {
   ChatSession? _chatSession;
   String? _currentModelName;
+  late SearchCacheDataSource _cacheDataSource;
 
   static List<String>? _cachedVisionModels;
   static DateTime? _cacheTime;
@@ -33,7 +35,9 @@ class AIRemoteDataSourceImpl implements AIRemoteDataSource {
 
   final Map<String, DateTime> _modelCooldowns = {};
 
-  AIRemoteDataSourceImpl();
+  AIRemoteDataSourceImpl() {
+    _cacheDataSource = SearchCacheDataSource();
+  }
 
   static String _buildSystemPrompt() {
     final now = DateTime.now();
@@ -354,7 +358,6 @@ When analyzing images:
     return '⚠️ Vision service temporarily unavailable. Please try again shortly.';
   }
 
-  // ✅ UPDATED: _callVisionWithTools with callback parameter
   Future<String> _callVisionWithTools({
     required String modelName,
     required String prompt,
@@ -375,15 +378,19 @@ When analyzing images:
         ),
       );
 
-      final initialContent = [
+      // ✅ CREATE CHAT SESSION (maintains conversation context)
+      final session = model.startChat();
+
+      print('🔍 [Vision] Sending initial vision request...');
+
+      // ✅ SEND THROUGH SESSION (not direct generateContent)
+      var response = await session.sendMessage(
         Content.multi([
           TextPart(prompt),
           DataPart('image/jpeg', Uint8List.fromList(imageBytes)),
         ]),
-      ];
+      );
 
-      print('🔍 [Vision] Sending initial vision request...');
-      var response = await model.generateContent(initialContent);
       print('🔍 [Vision] Initial response received');
       print(
         '🔍 [Vision] Has function calls: ${response.functionCalls.isNotEmpty}',
@@ -406,9 +413,9 @@ When analyzing images:
           print('🔍 [Vision] Search tool detected!');
           print('🔍 [Vision] Returning "Searching..." immediately');
 
-          // Execute search in background
+          // ✅ PASS SESSION TO ASYNC HANDLER (not model)
           _executeVisionSearchAsync(
-            model: model,
+            session: session,
             response: response,
             onSearchCompleted: onSearchCompleted,
           );
@@ -436,9 +443,10 @@ When analyzing images:
 
         print('🔍 [Vision] Sending function responses to API...');
         try {
-          response = await model.generateContent([
+          // ✅ SEND THROUGH SESSION (maintains context)
+          response = await session.sendMessage(
             Content.model(functionResponseParts),
-          ]);
+          );
           print('🔍 [Vision] Function response accepted');
         } catch (e) {
           print('🔍 [Vision] ❌ ERROR sending response: $e');
@@ -460,38 +468,116 @@ When analyzing images:
     }
   }
 
-  // ✅ NEW: Execute search in background and emit result
   Future<void> _executeVisionSearchAsync({
-    required GenerativeModel model,
+    required ChatSession
+    session, // ✅ CHANGED: ChatSession instead of GenerativeModel
     required GenerateContentResponse response,
     required Function(String finalResponse) onSearchCompleted,
   }) async {
     print('🔍 [Vision-Async] Starting background search...');
 
     try {
-      // Execute all search tools
+      // Execute all search tools with timeout
       final functionResponseParts = <Part>[];
 
       for (final functionCall in response.functionCalls) {
         print('🔍 [Vision-Async] Executing: ${functionCall.name}');
 
-        final toolResult = await ToolExecutor.execute(
-          functionCall.name,
-          functionCall.args,
-        );
+        try {
+          // ✅ Add timeout to tool execution
+          final toolResult =
+              await ToolExecutor.execute(
+                functionCall.name,
+                functionCall.args,
+              ).timeout(
+                Duration(seconds: 5),
+                onTimeout: () {
+                  print('⏱️ [Vision-Async] Tool timeout: ${functionCall.name}');
+                  return {
+                    'success': false,
+                    'error': 'Tool execution timed out',
+                    'message': 'Search took too long',
+                  };
+                },
+              );
 
-        print('🔍 [Vision-Async] Tool result received');
-        functionResponseParts.add(
-          FunctionResponse(functionCall.name, toolResult),
-        );
+          print('🔍 [Vision-Async] Tool result received');
+
+          // ✅ Cache search results if successful
+          if (functionCall.name == 'search_web' &&
+              toolResult['success'] == true &&
+              toolResult['results'] != null) {
+            final searchQuery = functionCall.args?['query'] ?? 'unknown';
+            final results = toolResult['results'] as List?;
+
+            if (results != null && results.isNotEmpty) {
+              print(
+                '💾 [Vision-Async] Caching search results for: "$searchQuery"',
+              );
+              await _cacheDataSource.cacheSearchResults(
+                searchQuery as String,
+                List<Map<String, dynamic>>.from(results),
+              );
+            }
+          }
+
+          functionResponseParts.add(
+            FunctionResponse(functionCall.name, toolResult),
+          );
+        } catch (e) {
+          print('🔍 [Vision-Async] Tool error: $e');
+
+          // ✅ Try cache if search tool fails
+          if (functionCall.name == 'search_web') {
+            final searchQuery = functionCall.args?['query'] ?? 'unknown';
+            print(
+              '💾 [Vision-Async] Trying cached results for: "$searchQuery"',
+            );
+
+            final cachedResults = await _cacheDataSource.getCachedResults(
+              searchQuery as String,
+            );
+
+            if (cachedResults != null && cachedResults.isNotEmpty) {
+              print(
+                '✅ [Vision-Async] Found ${cachedResults.length} cached results',
+              );
+              functionResponseParts.add(
+                FunctionResponse(functionCall.name, {
+                  'success': true,
+                  'results': cachedResults,
+                  'cached': true,
+                  'message': 'Using cached results (live search failed)',
+                }),
+              );
+            } else {
+              print('❌ [Vision-Async] No cached results available');
+              functionResponseParts.add(
+                FunctionResponse(functionCall.name, {
+                  'success': false,
+                  'error': 'Search failed and no cached results available',
+                  'message': 'Please try again',
+                }),
+              );
+            }
+          } else {
+            // Non-search tool failed
+            functionResponseParts.add(
+              FunctionResponse(functionCall.name, {
+                'success': false,
+                'error': e.toString(),
+              }),
+            );
+          }
+        }
       }
 
       print('🔍 [Vision-Async] Sending search results to Gemini...');
 
-      // Send results back to Gemini to generate final response
-      final finalResponse = await model.generateContent([
+      // ✅ FIXED: Send through session (maintains conversation context)
+      final finalResponse = await session.sendMessage(
         Content.model(functionResponseParts),
-      ]);
+      );
 
       final finalText = finalResponse.text;
       print(
@@ -505,7 +591,7 @@ When analyzing images:
         print(
           '🔍 [Vision-Async] Empty response, calling callback with default',
         );
-        onSearchCompleted('Search completed. Here\'s what I found.');
+        onSearchCompleted('Search completed');
       }
     } catch (e) {
       print('🔍 [Vision-Async] ❌ ERROR: $e');

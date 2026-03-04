@@ -1,0 +1,3787 @@
+import 'package:fl_ai/core/tools/tool_executor.dart';
+import 'package:fl_ai/domain/usecases/clear_chat_history_usecase.dart';
+import 'package:get_it/get_it.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:flutter_tts/flutter_tts.dart';
+
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'presentation/blocs/speech/speech_bloc.dart';
+import 'presentation/blocs/ai_chat/ai_chat_bloc.dart';
+import 'presentation/blocs/camera/camera_bloc.dart'; // ✅ NEW
+
+import 'domain/usecases/listen_to_speech_usecase.dart';
+import 'domain/usecases/speak_text_usecase.dart';
+import 'domain/usecases/get_ai_response_usecase.dart';
+
+import 'domain/repositories/ai_repository.dart';
+import 'data/repositories/ai_repository_impl.dart';
+
+import 'data/datasources/remote/ai_remote_datasource.dart';
+import 'data/datasources/local/ai_local_datasource.dart';
+
+final sl = GetIt.instance;
+
+Future<void> init() async {
+  _initSpeechFeatures();
+  _initAIFeatures();
+  _initCameraFeatures(); // ✅ NEW
+
+  await ToolExecutor.init();
+}
+
+void _initSpeechFeatures() {
+  sl.registerFactory(
+    () => SpeechBloc(
+      listenToSpeech: sl(),
+      stopListening: sl(),
+      speakText: sl(),
+      stopSpeaking: sl(),
+    ),
+  );
+
+  sl.registerLazySingleton(() => ListenToSpeechUseCase(sl()));
+  sl.registerLazySingleton(() => StopListeningUseCase(sl()));
+  sl.registerLazySingleton(() => SpeakTextUseCase(sl()));
+  sl.registerLazySingleton(() => StopSpeakingUseCase(sl()));
+}
+
+void _initAIFeatures() {
+  sl.registerFactory(
+    () => AIChatBloc(
+      getAIResponse: sl(),
+      getChatHistory: sl(),
+      clearChatHistory: sl(),
+      speakText: sl(),
+    ),
+  );
+
+  sl.registerLazySingleton(() => GetAIResponseUseCase(sl()));
+  sl.registerLazySingleton(() => GetChatHistoryUseCase(sl()));
+  sl.registerLazySingleton(() => ClearChatHistoryUseCase(sl()));
+
+  sl.registerLazySingleton<AIRepository>(
+    () => AIRepositoryImpl(remoteDataSource: sl(), localDataSource: sl()),
+  );
+
+  sl.registerLazySingleton<AIRemoteDataSource>(() => AIRemoteDataSourceImpl());
+  sl.registerLazySingleton<AILocalDataSource>(() => AILocalDataSourceImpl());
+}
+
+// ✅ NEW
+void _initCameraFeatures() {
+  // CameraBloc is created directly in CameraPage (not registered here)
+  // because each camera screen needs its own controller instance
+}
+import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'injection_container.dart' as di;
+import 'presentation/pages/home_page.dart';
+import 'core/constants/app_constants.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Load .env file
+  try {
+    await dotenv.load(fileName: ".env");
+    print("✅ .env file loaded successfully");
+
+    // Test if API key is available
+    final apiKey = AppConstants.geminiApiKey;
+    print(
+      "✅ API key loaded: ${apiKey.substring(0, 5)}...${apiKey.substring(apiKey.length - 5)}",
+    );
+  } catch (e) {
+    print("❌ Error: $e");
+  }
+
+  await di.init();
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'FL AI Assistant',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(primarySwatch: Colors.deepPurple, useMaterial3: true),
+      home: const HomePage(),
+    );
+  }
+}
+// lib/core/ai/gemini_model_manager.dart
+
+import 'package:shared_preferences/shared_preferences.dart';
+
+class GeminiModelManager {
+  // ── Model priority list (best → fallback) ────────
+  // ✅ Updated: removed deprecated gemini-1.5-flash
+  // ✅ Added:   gemini-2.5-flash-lite as last resort
+  static const List<String> _models = [
+    'gemini-2.5-flash', // 🥇 Best quality (500 RPD free)
+    'gemini-2.5-flash-lite', // 🥈 Lighter/faster version
+    'gemini-2.0-flash-lite', // 🥉 Last resort fallback
+  ];
+
+  static const String _prefKey = 'current_model_index';
+  static const String _cooldownPrefix = 'model_cooldown_';
+
+  // ── Get current active model ──────────────────────
+  static Future<String> getCurrentModel() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // Find first model that is NOT in cooldown
+    for (int i = 0; i < _models.length; i++) {
+      final model = _models[i];
+      if (!await _isInCooldown(model, prefs)) {
+        await prefs.setInt(_prefKey, i);
+        print('🤖 [ModelManager] Active model: $model');
+        return model;
+      }
+      print('⏳ [ModelManager] $model is in cooldown — skipping');
+    }
+
+    // All models in cooldown — return last one and let it retry
+    print('⚠️ [ModelManager] All models in cooldown — using last fallback');
+    return _models.last;
+  }
+
+  // In GeminiModelManager class
+  static Future<String> onQuotaExceeded(
+    String failedModel,
+    int retryAfterSeconds,
+  ) async {
+    print('🔍 [DEBUG QUOTA] Model $failedModel exceeded quota');
+    print('🔍 [DEBUG QUOTA] Retry after: $retryAfterSeconds seconds');
+
+    final prefs = await SharedPreferences.getInstance();
+
+    final effectiveCooldown = retryAfterSeconds > 600
+        ? 21600 // 6 hours for unavailable models
+        : retryAfterSeconds + 5; // +5s buffer for normal quota
+
+    final cooldownUntil = DateTime.now()
+        .add(Duration(seconds: effectiveCooldown))
+        .millisecondsSinceEpoch;
+
+    await prefs.setInt('$_cooldownPrefix$failedModel', cooldownUntil);
+    print(
+      '🔍 [DEBUG QUOTA] $failedModel → cooldown until ${DateTime.fromMillisecondsSinceEpoch(cooldownUntil)}',
+    );
+    print('🔍 [DEBUG QUOTA] Cooldown duration: ${effectiveCooldown}s');
+
+    // Find next available model
+    for (final model in _models) {
+      if (model != failedModel && !await _isInCooldown(model, prefs)) {
+        print('🔍 [DEBUG QUOTA] Switching: $failedModel → $model');
+        return model;
+      }
+    }
+
+    print('🔍 [DEBUG QUOTA] No available models — all in cooldown');
+    return failedModel;
+  }
+
+  // ── Check if a model is currently in cooldown ─────
+  static Future<bool> _isInCooldown(
+    String model,
+    SharedPreferences prefs,
+  ) async {
+    final cooldownUntil = prefs.getInt('$_cooldownPrefix$model') ?? 0;
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    if (now < cooldownUntil) {
+      final remaining = ((cooldownUntil - now) / 1000).ceil();
+      print('⏳ [ModelManager] $model cooldown: ${remaining}s remaining');
+      return true;
+    }
+
+    return false;
+  }
+
+  // ── Get remaining cooldown seconds for a model ────
+  static Future<int> getCooldownRemaining(String model) async {
+    final prefs = await SharedPreferences.getInstance();
+    final cooldownUntil = prefs.getInt('$_cooldownPrefix$model') ?? 0;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final remaining = ((cooldownUntil - now) / 1000).ceil();
+    return remaining > 0 ? remaining : 0;
+  }
+
+  // ── Get status of all models (for debug/UI) ───────
+  static Future<Map<String, dynamic>> getAllModelStatus() async {
+    final prefs = await SharedPreferences.getInstance();
+    final Map<String, dynamic> status = {};
+
+    for (final model in _models) {
+      final inCooldown = await _isInCooldown(model, prefs);
+      final remaining = await getCooldownRemaining(model);
+      status[model] = {
+        'available': !inCooldown,
+        'cooldown_remaining_seconds': remaining,
+      };
+    }
+
+    return status;
+  }
+
+  // ── Reset all cooldowns (for testing) ─────────────
+  static Future<void> resetAllCooldowns() async {
+    final prefs = await SharedPreferences.getInstance();
+    for (final model in _models) {
+      await prefs.remove('$_cooldownPrefix$model');
+    }
+    // Also clear old model names from previous versions
+    await prefs.remove('model_cooldown_gemini-1.5-flash');
+    await prefs.remove('model_cooldown_gemini-2.0-flash');
+    print('🔄 [ModelManager] All cooldowns reset');
+  }
+
+  // ── Parse retry seconds from Gemini error message ─
+  static int parseRetrySeconds(String errorMessage) {
+    // Gemini error: "Please retry in 49.269972253s"
+    final match = RegExp(r'retry in (\d+)').firstMatch(errorMessage);
+    return int.tryParse(match?.group(1) ?? '60') ?? 60;
+  }
+
+  // ── Check if error means model is unavailable ─────
+  // (limit: 0 means not available on this API key)
+  static bool isModelUnavailable(String errorMessage) {
+    return errorMessage.contains('limit: 0') ||
+        errorMessage.contains('not found') ||
+        errorMessage.contains('not supported') ||
+        errorMessage.contains('PERMISSION_DENIED');
+  }
+}
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+
+class AppConstants {
+  static String get appName => dotenv.env['APP_NAME'] ?? 'FL AI Assistant';
+  static String get geminiApiKey {
+    final key = dotenv.env['GEMINI_API_KEY'];
+    if (key == null || key.isEmpty) {
+      throw Exception('GEMINI_API_KEY not found in .env file');
+    }
+    return key;
+  }
+
+  // ── OpenWeather API Key ───────────────────────
+  static String get openWeatherApiKey {
+    final key = dotenv.env['OPENWEATHER_API_KEY'] ?? '';
+    if (key.isEmpty) {
+      throw Exception(
+        '❌ OPENWEATHER_API_KEY is missing in .env file.\n'
+        '   Add: OPENWEATHER_API_KEY=your_key_here',
+      );
+    }
+    return key;
+  }
+
+  // Speech settings
+  static const double speechRate = 0.5;
+  static const double pitch = 1.0;
+  static const Duration listenDuration = Duration(seconds: 30);
+  static const Duration pauseDuration = Duration(seconds: 3);
+
+  // UI Constants
+  static const double micButtonSize = 80;
+  static const double animationDuration = 1500;
+}
+import 'package:equatable/equatable.dart';
+
+abstract class Failure extends Equatable {
+  final String message;
+
+  const Failure(this.message);
+
+  @override
+  List<Object> get props => [message];
+}
+
+class ServerFailure extends Failure {
+  const ServerFailure(String message) : super(message);
+}
+
+class SpeechRecognitionFailure extends Failure {
+  const SpeechRecognitionFailure(String message) : super(message);
+}
+
+class TTSFailure extends Failure {
+  const TTSFailure(String message) : super(message);
+}
+
+class PermissionFailure extends Failure {
+  const PermissionFailure(String message) : super(message);
+}
+// lib/core/tools/tool_executor.dart
+
+import 'dart:convert';
+import 'package:fl_ai/core/constants/app_constants.dart';
+import 'package:flutter_contacts/flutter_contacts.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:http/http.dart' as http;
+import 'package:intl/intl.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:timezone/data/latest.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+import 'package:torch_light/torch_light.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+class ToolExecutor {
+  static final FlutterLocalNotificationsPlugin _notifications =
+      FlutterLocalNotificationsPlugin();
+
+  // ── Initialize notifications once at app start ──
+  static Future<void> init() async {
+    tz.initializeTimeZones();
+
+    const androidSettings = AndroidInitializationSettings(
+      '@mipmap/ic_launcher',
+    );
+    const iosSettings = DarwinInitializationSettings();
+
+    await _notifications.initialize(
+      settings: const InitializationSettings(
+        android: androidSettings,
+        iOS: iosSettings,
+      ),
+      onDidReceiveNotificationResponse: (response) {},
+    );
+  }
+
+  // ── Main dispatcher ──────────────────────────────
+  static Future<Map<String, dynamic>> execute(
+    String toolName,
+    Map<String, dynamic> args,
+  ) async {
+    print('🔧 Executing tool: $toolName with args: $args');
+
+    switch (toolName) {
+      case 'get_weather':
+        return await _getWeather(args['location'] as String);
+
+      case 'set_alarm':
+        return await _setAlarm(
+          args['time'] as String,
+          args['label'] as String? ?? 'Alarm',
+        );
+
+      case 'make_call':
+        return await _makeCall(args['contact_name'] as String);
+
+      case 'phone_call': // ✅ NEW
+        return await _phoneCall(args['phone_number'] as String);
+
+      case 'toggle_flashlight':
+        return await _toggleFlashlight(args['state'] as String);
+
+      case 'open_web_search':
+        return await _openWebSearch(args['query'] as String);
+
+      case 'get_time':
+        return _getTime();
+
+      case 'get_date':
+        return _getDate();
+
+      default:
+        return {'success': false, 'error': 'Unknown tool: $toolName'};
+    }
+  }
+
+  // ── 🌤️ WEATHER ───────────────────────────────────
+  static Future<Map<String, dynamic>> _getWeather(String location) async {
+    try {
+      final apiKey = AppConstants.openWeatherApiKey;
+      final url =
+          'https://api.openweathermap.org/data/2.5/weather'
+          '?q=$location&appid=$apiKey&units=metric';
+
+      final response = await http.get(Uri.parse(url));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        return {
+          'success': true,
+          'location': data['name'],
+          'temperature': data['main']['temp'],
+          'feels_like': data['main']['feels_like'],
+          'condition': data['weather'][0]['description'],
+          'humidity': data['main']['humidity'],
+        };
+      } else {
+        return {'success': false, 'error': 'Weather API error'};
+      }
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // ── ⏰ ALARM ──────────────────────────────────────
+  static Future<Map<String, dynamic>> _setAlarm(
+    String time,
+    String label,
+  ) async {
+    try {
+      await Permission.notification.request();
+
+      final parts = time.split(':');
+      final hour = int.parse(parts[0]);
+      final minute = int.parse(parts[1]);
+
+      final now = DateTime.now();
+      var alarmTime = DateTime(now.year, now.month, now.day, hour, minute);
+
+      if (alarmTime.isBefore(now)) {
+        alarmTime = alarmTime.add(const Duration(days: 1));
+      }
+
+      final tzAlarmTime = tz.TZDateTime.from(alarmTime, tz.local);
+
+      await _notifications.zonedSchedule(
+        id: alarmTime.millisecondsSinceEpoch ~/ 1000,
+        title: '⏰ $label',
+        body: 'Your alarm is ringing!',
+        scheduledDate: tzAlarmTime,
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'alarm_channel',
+            'Alarms',
+            channelDescription: 'Alarm notifications',
+            importance: Importance.max,
+            priority: Priority.high,
+          ),
+        ),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      );
+
+      return {
+        'success': true,
+        'scheduled_at': alarmTime.toIso8601String(),
+        'label': label,
+      };
+    } catch (e) {
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // ── 📞 CALL BY CONTACT NAME ───────────────────────
+  static Future<Map<String, dynamic>> _makeCall(String contactName) async {
+    try {
+      print('📞 [Call] Starting call to: "$contactName"');
+
+      // ── Step 1: Check permanent denial first ─────
+      final contactsStatus = await Permission.contacts.status;
+      final phoneStatus = await Permission.phone.status;
+
+      print('📞 [Call] Contacts permission: $contactsStatus');
+      print('📞 [Call] Phone permission   : $phoneStatus');
+
+      if (contactsStatus.isPermanentlyDenied) {
+        print('❌ [Call] Contacts permanently denied → opening settings');
+        await openAppSettings();
+        return {
+          'success': false,
+          'error':
+              'Contacts permission permanently denied. '
+              'Please enable it in Settings.',
+        };
+      }
+
+      if (phoneStatus.isPermanentlyDenied) {
+        print('❌ [Call] Phone permanently denied → opening settings');
+        await openAppSettings();
+        return {
+          'success': false,
+          'error':
+              'Phone permission permanently denied. '
+              'Please enable it in Settings.',
+        };
+      }
+
+      // ── Step 2: Request permissions SEPARATELY ────
+      if (!contactsStatus.isGranted) {
+        print('📞 [Call] Requesting contacts permission...');
+        final contactsResult = await Permission.contacts.request();
+        print('📞 [Call] Contacts result: $contactsResult');
+
+        if (!contactsResult.isGranted) {
+          print('❌ [Call] Contacts permission denied');
+          return {
+            'success': false,
+            'error':
+                'Contacts permission denied. '
+                'Please allow contacts access to make calls.',
+          };
+        }
+      }
+
+      if (!phoneStatus.isGranted) {
+        print('📞 [Call] Requesting phone permission...');
+        final phoneResult = await Permission.phone.request();
+        print('📞 [Call] Phone result: $phoneResult');
+
+        if (!phoneResult.isGranted) {
+          print('❌ [Call] Phone permission denied');
+          return {
+            'success': false,
+            'error':
+                'Phone call permission denied. '
+                'Please allow phone access to make calls.',
+          };
+        }
+      }
+
+      print('✅ [Call] Both permissions granted');
+
+      // ── Step 3: Load contacts ─────────────────────
+      final contacts = await FlutterContacts.getContacts(withProperties: true);
+      print('📞 [Call] Total contacts loaded: ${contacts.length}');
+
+      if (contacts.isEmpty) {
+        return {'success': false, 'error': 'No contacts found on this device.'};
+      }
+
+      // ── Step 4: Find best match ───────────────────
+      Contact? match;
+
+      try {
+        match = contacts.firstWhere(
+          (c) =>
+              c.displayName.toLowerCase().trim() ==
+              contactName.toLowerCase().trim(),
+        );
+        print('✅ [Call] Exact match: ${match.displayName}');
+      } catch (_) {
+        match = null;
+      }
+
+      if (match == null || match.id.isEmpty) {
+        try {
+          match = contacts.firstWhere(
+            (c) => c.displayName.toLowerCase().contains(
+              contactName.toLowerCase().trim(),
+            ),
+          );
+          print('✅ [Call] Partial match: ${match.displayName}');
+        } catch (_) {
+          match = null;
+        }
+      }
+
+      // ── Step 5: Validate match ────────────────────
+      if (match == null || match.id.isEmpty) {
+        print('❌ [Call] No contact found for "$contactName"');
+        return {
+          'success': false,
+          'error':
+              'No contact named "$contactName" found. '
+              'Please check the name and try again.',
+        };
+      }
+
+      if (match.phones.isEmpty) {
+        print('❌ [Call] No phone number for: ${match.displayName}');
+        return {
+          'success': false,
+          'error': '${match.displayName} has no phone number saved.',
+        };
+      }
+
+      // ── Step 6: Dial ──────────────────────────────
+      final rawNumber = match.phones.first.number;
+      final phoneNumber = rawNumber.replaceAll(RegExp(r'[\s\-\(\)]'), '');
+      final uri = Uri.parse('tel:$phoneNumber');
+
+      print('📞 [Call] Dialing: ${match.displayName} → $phoneNumber');
+
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri);
+        print('✅ [Call] Call launched successfully');
+        return {
+          'success': true,
+          'message': 'Calling ${match.displayName}',
+          'contact': match.displayName,
+          'number': phoneNumber,
+        };
+      }
+
+      print('❌ [Call] Cannot launch dialer');
+      return {
+        'success': false,
+        'error': 'Cannot open the phone dialer on this device.',
+      };
+    } catch (e) {
+      print('❌ [Call] Unexpected error: $e');
+      return {
+        'success': false,
+        'error': 'Failed to make call: ${e.toString()}',
+      };
+    }
+  }
+
+  // ── 📞 CALL BY PHONE NUMBER ───────────────────────  ✅ NEW
+  static Future<Map<String, dynamic>> _phoneCall(String phoneNumber) async {
+    try {
+      print('📞 [DirectCall] Calling number: "$phoneNumber"');
+
+      // ── Step 1: Check phone permission ────────────
+      final phoneStatus = await Permission.phone.status;
+      print('📞 [DirectCall] Phone permission: $phoneStatus');
+
+      if (phoneStatus.isPermanentlyDenied) {
+        print('❌ [DirectCall] Phone permanently denied → opening settings');
+        await openAppSettings();
+        return {
+          'success': false,
+          'error':
+              'Phone permission permanently denied. '
+              'Please enable it in Settings.',
+        };
+      }
+
+      if (!phoneStatus.isGranted) {
+        print('📞 [DirectCall] Requesting phone permission...');
+        final phoneResult = await Permission.phone.request();
+        print('📞 [DirectCall] Phone result: $phoneResult');
+
+        if (!phoneResult.isGranted) {
+          print('❌ [DirectCall] Phone permission denied');
+          return {
+            'success': false,
+            'error':
+                'Phone call permission denied. '
+                'Please allow phone access to make calls.',
+          };
+        }
+      }
+
+      print('✅ [DirectCall] Phone permission granted');
+
+      // ── Step 2: Clean and validate number ─────────
+      // Remove spaces, dashes, parentheses
+      final cleanNumber = phoneNumber.replaceAll(RegExp(r'[\s\-\(\)]'), '');
+
+      // Basic validation (at least 3 digits)
+      if (cleanNumber.length < 3) {
+        print('❌ [DirectCall] Invalid number: "$phoneNumber"');
+        return {
+          'success': false,
+          'error': 'Invalid phone number: "$phoneNumber"',
+        };
+      }
+
+      print('📞 [DirectCall] Cleaned number: $cleanNumber');
+
+      // ── Step 3: Launch dialer ─────────────────────
+      final uri = Uri.parse('tel:$cleanNumber');
+
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri);
+        print('✅ [DirectCall] Call launched successfully');
+        return {
+          'success': true,
+          'message': 'Calling $cleanNumber',
+          'number': cleanNumber,
+        };
+      }
+
+      print('❌ [DirectCall] Cannot launch dialer');
+      return {
+        'success': false,
+        'error': 'Cannot open the phone dialer on this device.',
+      };
+    } catch (e) {
+      print('❌ [DirectCall] Unexpected error: $e');
+      return {
+        'success': false,
+        'error': 'Failed to make call: ${e.toString()}',
+      };
+    }
+  }
+
+  // ── 🔦 FLASHLIGHT ─────────────────────────────────
+  static Future<Map<String, dynamic>> _toggleFlashlight(String state) async {
+    try {
+      final turnOn = state.toLowerCase() == 'on';
+
+      final hasTorch = await TorchLight.isTorchAvailable();
+      if (!hasTorch) {
+        print('❌ [Flashlight] No torch on this device');
+        return {'success': false, 'error': 'This device has no flashlight'};
+      }
+
+      if (turnOn) {
+        await TorchLight.enableTorch();
+        print('✅ [Flashlight] Turned ON');
+      } else {
+        await TorchLight.disableTorch();
+        print('✅ [Flashlight] Turned OFF');
+      }
+
+      return {'success': true, 'state': state};
+    } on EnableTorchExistentUserException catch (_) {
+      print('❌ [Flashlight] Camera in use — cannot enable torch');
+      return {'success': false, 'error': 'Camera is in use by another app'};
+    } on EnableTorchNotAvailableException catch (_) {
+      print('❌ [Flashlight] Torch not available on this device');
+      return {'success': false, 'error': 'Torch not available'};
+    } on EnableTorchException catch (e) {
+      print('❌ [Flashlight] Enable error: $e');
+      return {'success': false, 'error': 'Could not enable flashlight'};
+    } on DisableTorchExistentUserException catch (_) {
+      print('❌ [Flashlight] Camera in use — cannot disable torch');
+      return {'success': false, 'error': 'Camera is in use by another app'};
+    } on DisableTorchNotAvailableException catch (_) {
+      print('❌ [Flashlight] Torch not available on this device');
+      return {'success': false, 'error': 'Torch not available'};
+    } on DisableTorchException catch (e) {
+      print('❌ [Flashlight] Disable error: $e');
+      return {'success': false, 'error': 'Could not disable flashlight'};
+    } catch (e) {
+      print('❌ [Flashlight] Unexpected: $e');
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // ── 🌐 WEB SEARCH ─────────────────────────────────
+  static Future<Map<String, dynamic>> _openWebSearch(String query) async {
+    try {
+      final uri = Uri.https('www.google.com', '/search', {'q': query});
+      print('🌐 [Search] Launching: $uri');
+
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+        print('✅ [Search] Opened: $query');
+        return {'success': true, 'query': query};
+      }
+
+      final fallback = await launchUrl(uri, mode: LaunchMode.platformDefault);
+      if (fallback) {
+        print('✅ [Search] Opened via fallback: $query');
+        return {'success': true, 'query': query};
+      }
+
+      print('❌ [Search] Cannot open browser');
+      return {'success': false, 'error': 'Cannot open browser'};
+    } catch (e) {
+      print('❌ [Search] Error: $e');
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // ── 🕐 TIME ───────────────────────────────────────
+  static Map<String, dynamic> _getTime() {
+    try {
+      final now = DateTime.now();
+      final time12h = DateFormat('hh:mm:ss a').format(now);
+      final time24h = DateFormat('HH:mm:ss').format(now);
+      final timezone = now.timeZoneName;
+      final offsetHours = now.timeZoneOffset.inHours;
+      final offsetMins = now.timeZoneOffset.inMinutes.abs() % 60;
+      final offsetStr =
+          'UTC${offsetHours >= 0 ? '+' : ''}$offsetHours'
+          '${offsetMins > 0 ? ':$offsetMins' : ''}';
+
+      print('✅ [Time] $time12h ($timezone / $offsetStr)');
+
+      return {
+        'success': true,
+        'time_12h': time12h,
+        'time_24h': time24h,
+        'timezone': timezone,
+        'utc_offset': offsetStr,
+        'timestamp': now.millisecondsSinceEpoch,
+      };
+    } catch (e) {
+      print('❌ [Time] Error: $e');
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // ── 📅 DATE ───────────────────────────────────────
+  static Map<String, dynamic> _getDate() {
+    try {
+      final now = DateTime.now();
+      final dateFull = DateFormat('EEEE, MMMM d, y').format(now);
+      final dateShort = DateFormat('dd/MM/yyyy').format(now);
+      final dateIso = DateFormat('yyyy-MM-dd').format(now);
+      final dayOfWeek = DateFormat('EEEE').format(now);
+      final month = DateFormat('MMMM').format(now);
+
+      print('✅ [Date] $dateFull');
+
+      return {
+        'success': true,
+        'date_full': dateFull,
+        'date_short': dateShort,
+        'date_iso': dateIso,
+        'day_of_week': dayOfWeek,
+        'month': month,
+        'day': now.day,
+        'year': now.year,
+      };
+    } catch (e) {
+      print('❌ [Date] Error: $e');
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+}
+// lib/core/tools/tool_registry.dart
+
+import 'package:google_generative_ai/google_generative_ai.dart';
+
+class ToolRegistry {
+  static List<Tool> getTools() {
+    return [
+      Tool(
+        functionDeclarations: [
+          // ── 🌤️ WEATHER ──────────────────────────────
+          FunctionDeclaration(
+            'get_weather',
+            'Get current temperature and weather condition at a location',
+            Schema(
+              SchemaType.object,
+              properties: {
+                'location': Schema(
+                  SchemaType.string,
+                  description: 'City name, e.g. Dhaka, London',
+                ),
+              },
+              requiredProperties: ['location'],
+            ),
+          ),
+
+          // ── ⏰ ALARM ─────────────────────────────────
+          FunctionDeclaration(
+            'set_alarm',
+            'Set an alarm or reminder at a specific time',
+            Schema(
+              SchemaType.object,
+              properties: {
+                'time': Schema(
+                  SchemaType.string,
+                  description: 'Time in HH:MM 24-hour format e.g. 14:00',
+                ),
+                'label': Schema(
+                  SchemaType.string,
+                  description: 'Alarm label or title',
+                ),
+              },
+              requiredProperties: ['time', 'label'],
+            ),
+          ),
+
+          // ── 📞 CALL BY CONTACT NAME ──────────────────
+          FunctionDeclaration(
+            'make_call',
+            'Make a phone call to a saved contact by their name',
+            Schema(
+              SchemaType.object,
+              properties: {
+                'contact_name': Schema(
+                  SchemaType.string,
+                  description: 'Full or partial name of the contact',
+                ),
+              },
+              requiredProperties: ['contact_name'],
+            ),
+          ),
+
+          // ── 📞 CALL BY PHONE NUMBER ──────────────────  ✅ NEW
+          FunctionDeclaration(
+            'phone_call',
+            'Make a phone call to a specific phone number directly (not from contacts)',
+            Schema(
+              SchemaType.object,
+              properties: {
+                'phone_number': Schema(
+                  SchemaType.string,
+                  description:
+                      'Phone number to call, e.g. +8801712345678 or 555-1234',
+                ),
+              },
+              requiredProperties: ['phone_number'],
+            ),
+          ),
+
+          // ── 🔦 FLASHLIGHT ────────────────────────────
+          FunctionDeclaration(
+            'toggle_flashlight',
+            'Turn the device flashlight on or off',
+            Schema(
+              SchemaType.object,
+              properties: {
+                'state': Schema(SchemaType.string, description: 'on or off'),
+              },
+              requiredProperties: ['state'],
+            ),
+          ),
+
+          // ── 🌐 WEB SEARCH ────────────────────────────
+          FunctionDeclaration(
+            'open_web_search',
+            'Open a web search for a given query in the browser',
+            Schema(
+              SchemaType.object,
+              properties: {
+                'query': Schema(
+                  SchemaType.string,
+                  description: 'The search query string',
+                ),
+              },
+              requiredProperties: ['query'],
+            ),
+          ),
+        ],
+      ),
+    ];
+  }
+}
+import 'package:dartz/dartz.dart';
+import 'package:equatable/equatable.dart';
+import '../errors/failures.dart';
+
+abstract class UseCase<Type, Params> {
+  Future<Either<Failure, Type>> call(Params params);
+}
+
+class NoParams extends Equatable {
+  @override
+  List<Object> get props => [];
+}
+import '../../models/message_model.dart';
+
+abstract class AILocalDataSource {
+  Future<List<MessageModel>> getChatHistory();
+  Future<void> saveMessage(MessageModel message);
+  Future<void> clearChatHistory();
+}
+
+class AILocalDataSourceImpl implements AILocalDataSource {
+  final List<MessageModel> _messages = [];
+
+  @override
+  Future<List<MessageModel>> getChatHistory() async {
+    return _messages;
+  }
+
+  @override
+  Future<void> saveMessage(MessageModel message) async {
+    _messages.add(message);
+  }
+
+  @override
+  Future<void> clearChatHistory() async {
+    _messages.clear();
+  }
+}
+import 'dart:async';
+import 'dart:io';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import '../../../core/constants/app_constants.dart';
+import '../../../core/tools/tool_executor.dart';
+import '../../../core/tools/tool_registry.dart';
+import '../../../core/ai/gemini_model_manager.dart';
+
+abstract class AIRemoteDataSource {
+  Future<String> getAIResponse(String query);
+  Future<String> getAIResponseWithImage(String query, File imageFile);
+  void resetSession();
+}
+
+class AIRemoteDataSourceImpl implements AIRemoteDataSource {
+  ChatSession? _chatSession;
+  String? _currentModelName;
+
+  static List<String>? _cachedVisionModels;
+  static DateTime? _cacheTime;
+  static const _cacheDuration = Duration(hours: 1);
+
+  final Map<String, DateTime> _modelCooldowns = {};
+
+  AIRemoteDataSourceImpl();
+
+  static String _buildSystemPrompt() {
+    final now = DateTime.now();
+    final weekdays = [
+      'Monday',
+      'Tuesday',
+      'Wednesday',
+      'Thursday',
+      'Friday',
+      'Saturday',
+      'Sunday',
+    ];
+    final months = [
+      'January',
+      'February',
+      'March',
+      'April',
+      'May',
+      'June',
+      'July',
+      'August',
+      'September',
+      'October',
+      'November',
+      'December',
+    ];
+    final weekday = weekdays[now.weekday - 1];
+    final month = months[now.month - 1];
+    final day = now.day;
+    final year = now.year;
+    final hour12 = now.hour == 0
+        ? 12
+        : now.hour > 12
+        ? now.hour - 12
+        : now.hour;
+    final minute = now.minute.toString().padLeft(2, '0');
+    final amPm = now.hour < 12 ? 'AM' : 'PM';
+    final dateTimeStr = '$weekday, $month $day, $year at $hour12:$minute $amPm';
+
+    return '''
+You are a helpful AI voice assistant built into a Flutter app.
+
+📅 Current date and time: $dateTimeStr
+
+You can perform real device actions like:
+- Checking weather
+- Setting alarms and reminders
+- Making phone calls (by contact name OR direct phone number)
+- Toggling the flashlight
+- Opening web searches
+- Telling the current time and date
+
+When the user asks you to perform an action, use the appropriate tool.
+Always respond in a friendly, concise, conversational tone.
+If a tool call succeeds, confirm it naturally to the user.
+If a tool call fails, apologize and explain what went wrong.
+When asked for the time or date, use the current date and time provided above.
+
+When analyzing images:
+- Extract text, numbers, URLs, or other actionable information
+- If you see a phone number in the image and user asks to call it, use the phone_call tool with the number
+- If user mentions a contact name, use make_call tool with the contact name
+- For URLs, use open_web_search tool
+''';
+  }
+
+  GenerativeModel _buildModel(String modelName) {
+    final apiKey = AppConstants.geminiApiKey;
+    if (apiKey.isEmpty) throw Exception('Gemini API key is empty.');
+    return GenerativeModel(
+      model: modelName,
+      apiKey: apiKey,
+      tools: ToolRegistry.getTools(),
+      systemInstruction: Content.system(_buildSystemPrompt()),
+      generationConfig: GenerationConfig(
+        temperature: 0.7,
+        maxOutputTokens: 800,
+      ),
+    );
+  }
+
+  Future<ChatSession> _getOrCreateSession(String modelName) async {
+    if (_chatSession == null || _currentModelName != modelName) {
+      if (_currentModelName != null && _currentModelName != modelName) {
+        print('🔀 [Session] Model changed: $_currentModelName → $modelName');
+      }
+      _currentModelName = modelName;
+      _chatSession = _buildModel(modelName).startChat();
+      print('✅ [Session] New session started with: $modelName');
+    }
+    return _chatSession!;
+  }
+
+  Future<List<String>> _getAvailableVisionModels() async {
+    if (_cachedVisionModels != null &&
+        _cacheTime != null &&
+        DateTime.now().difference(_cacheTime!) < _cacheDuration) {
+      print('📦 Using cached vision models: $_cachedVisionModels');
+      return _cachedVisionModels!;
+    }
+
+    try {
+      final apiKey = AppConstants.geminiApiKey;
+      final url = Uri.parse(
+        'https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey',
+      );
+
+      print('🔍 Fetching available vision models...');
+      final response = await http.get(url).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final models = data['models'] as List;
+
+        final visionModels = <String>[];
+        for (final model in models) {
+          final name = model['name'] as String;
+          final supportedMethods = model['supportedGenerationMethods'] as List?;
+
+          if (supportedMethods != null &&
+              supportedMethods.contains('generateContent')) {
+            final modelName = name.replaceFirst('models/', '');
+
+            if (modelName.startsWith('gemini-') &&
+                _isVisionCapable(modelName)) {
+              visionModels.add(modelName);
+              print('✅ Found vision model: $modelName');
+            }
+          }
+        }
+
+        if (visionModels.isEmpty) {
+          print('⚠️ No vision models found, using fallback');
+          return [
+            'gemini-2.5-flash',
+            'gemini-2.0-flash',
+            'gemini-flash-latest',
+          ];
+        }
+
+        visionModels.sort((a, b) {
+          if (a.contains('2.5-flash') && !b.contains('2.5-flash')) return -1;
+          if (!a.contains('2.5-flash') && b.contains('2.5-flash')) return 1;
+          if (a.contains('2.5')) return -1;
+          if (b.contains('2.5')) return 1;
+          if (a.contains('2.0')) return -1;
+          if (b.contains('2.0')) return 1;
+          if (a.contains('flash')) return -1;
+          if (b.contains('flash')) return 1;
+          return 0;
+        });
+
+        _cachedVisionModels = visionModels;
+        _cacheTime = DateTime.now();
+
+        print('📋 Vision models available: ${visionModels.take(5).join(', ')}');
+        return visionModels;
+      } else {
+        print('⚠️ Failed to fetch models (${response.statusCode})');
+        return ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
+      }
+    } catch (e) {
+      print('⚠️ Error fetching models: $e');
+      return ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
+    }
+  }
+
+  bool _isVisionCapable(String modelName) {
+    if (modelName.contains('-tts')) {
+      print('⏭️ Skipping TTS model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('computer-use')) {
+      print('⏭️ Skipping computer-use model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('robotics')) {
+      print('⏭️ Skipping robotics model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('-lite')) {
+      print('⏭️ Skipping lite model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('-exp') && !modelName.contains('flash-exp')) {
+      print('⏭️ Skipping experimental model: $modelName');
+      return false;
+    }
+
+    if (modelName.contains('flash') || modelName.contains('pro')) {
+      return true;
+    }
+
+    print('⏭️ Skipping unknown model type: $modelName');
+    return false;
+  }
+
+  @override
+  Future<String> getAIResponse(String query) async {
+    print('👤 User query: $query');
+    const maxModelSwitches = 3;
+    int modelAttempts = 0;
+
+    while (modelAttempts < maxModelSwitches) {
+      final modelName = await GeminiModelManager.getCurrentModel();
+      try {
+        final session = await _getOrCreateSession(modelName);
+        var response = await session.sendMessage(Content.text(query));
+        int loopCount = 0;
+        const maxLoops = 5;
+
+        while (response.functionCalls.isNotEmpty && loopCount < maxLoops) {
+          loopCount++;
+          for (final functionCall in response.functionCalls) {
+            print('🔧 Tool: ${functionCall.name}');
+            final toolResult = await ToolExecutor.execute(
+              functionCall.name,
+              functionCall.args,
+            );
+            response = await session.sendMessage(
+              Content.functionResponse(functionCall.name, toolResult),
+            );
+          }
+        }
+
+        final finalText = response.text;
+        if (finalText == null || finalText.trim().isEmpty) {
+          return 'Action completed successfully.';
+        }
+        print('🤖 Response: $finalText');
+        return finalText;
+      } on GenerativeAIException catch (e) {
+        print('❌ GenerativeAI error: ${e.message}');
+        if (_isQuotaError(e.message)) {
+          final retrySeconds = GeminiModelManager.parseRetrySeconds(e.message);
+          final nextModel = await GeminiModelManager.onQuotaExceeded(
+            modelName,
+            retrySeconds,
+          );
+          if (nextModel == modelName) {
+            return '⚠️ All AI models are currently busy. Please try again in a minute!';
+          }
+          modelAttempts++;
+          continue;
+        }
+        if (_isModelNotFoundError(e.message)) {
+          print('💡 Model "$modelName" not supported — trying next...');
+          await GeminiModelManager.onQuotaExceeded(modelName, 21600);
+          modelAttempts++;
+          continue;
+        }
+        if (e.message.contains('thought_signature')) {
+          await GeminiModelManager.onQuotaExceeded(modelName, 21600);
+          modelAttempts++;
+          continue;
+        }
+        throw Exception('Gemini API error: ${e.message}');
+      } catch (e) {
+        throw Exception('Failed to get AI response: $e');
+      }
+    }
+    return '⚠️ Service temporarily unavailable. Please try again shortly.';
+  }
+
+  @override
+  Future<String> getAIResponseWithImage(String query, File imageFile) async {
+    print('📷 Image query: $query');
+    print('📁 Image path : ${imageFile.path}');
+
+    final visionModels = await _getAvailableVisionModels();
+
+    for (int i = 0; i < visionModels.length && i < 5; i++) {
+      final modelName = visionModels[i];
+
+      final cooldownUntil = _modelCooldowns[modelName];
+      if (cooldownUntil != null && DateTime.now().isBefore(cooldownUntil)) {
+        final waitSeconds = cooldownUntil.difference(DateTime.now()).inSeconds;
+        print('⏭️ $modelName in cooldown (${waitSeconds}s). Trying next...');
+        continue;
+      }
+
+      try {
+        final imageBytes = await imageFile.readAsBytes();
+        print('🖼️  Image loaded: ${imageBytes.lengthInBytes} bytes');
+
+        print('🌐 Calling vision API with tools for: $modelName');
+        final response = await _callVisionWithTools(
+          modelName: modelName,
+          prompt: query,
+          imageBytes: imageBytes,
+        );
+
+        if (response.isEmpty) {
+          return 'I can see the image but could not generate a response.';
+        }
+
+        _modelCooldowns.remove(modelName);
+        print('✅ Vision response from $modelName');
+        return response;
+      } catch (e) {
+        final errorMsg = e.toString();
+        print(
+          '❌ Vision error ($modelName): ${errorMsg.substring(0, errorMsg.length > 100 ? 100 : errorMsg.length)}',
+        );
+
+        if (errorMsg.contains('404') || errorMsg.contains('not found')) {
+          _modelCooldowns[modelName] = DateTime.now().add(
+            const Duration(hours: 1),
+          );
+          continue;
+        }
+
+        if (errorMsg.contains('429') ||
+            errorMsg.contains('quota') ||
+            errorMsg.contains('RESOURCE_EXHAUSTED')) {
+          final retrySeconds = _parseRetrySecondsFromError(errorMsg);
+          _modelCooldowns[modelName] = DateTime.now().add(
+            Duration(seconds: retrySeconds + 2),
+          );
+          continue;
+        }
+
+        if (e.toString().contains('quota') ||
+            e.toString().contains('RESOURCE_EXHAUSTED')) {
+          print('🔍 [DEBUG VISION] ⚠️ This is a QUOTA error');
+          // Parse retry seconds...
+          final retrySeconds = _parseRetrySecondsFromError(e.toString());
+          print('🔍 [DEBUG VISION] Setting cooldown for $retrySeconds seconds');
+          _modelCooldowns[modelName] = DateTime.now().add(
+            Duration(seconds: retrySeconds + 2),
+          );
+        }
+
+        _modelCooldowns[modelName] = DateTime.now().add(
+          const Duration(minutes: 5),
+        );
+        continue;
+      }
+    }
+
+    return '⚠️ Vision service temporarily unavailable. Please try again shortly.';
+  }
+
+  Future<String> _callVisionWithTools({
+    required String modelName,
+    required String prompt,
+    required List<int> imageBytes,
+  }) async {
+    DateTime _toolStartTime = DateTime.now();
+    try {
+      print('🔍 [DEBUG] Starting vision+tool call with model: $modelName');
+      print('🔍 [DEBUG] Prompt length: ${prompt.length} chars');
+      print('🔍 [DEBUG] Image size: ${imageBytes.length} bytes');
+
+      final model = GenerativeModel(
+        model: modelName,
+        apiKey: AppConstants.geminiApiKey,
+        tools: ToolRegistry.getTools(),
+        systemInstruction: Content.system(_buildSystemPrompt()),
+        generationConfig: GenerationConfig(
+          temperature: 0.7,
+          maxOutputTokens: 2048,
+        ),
+      );
+
+      // Initial request with image
+      final initialContent = [
+        Content.multi([
+          TextPart(prompt),
+          DataPart('image/jpeg', Uint8List.fromList(imageBytes)),
+        ]),
+      ];
+
+      print('🔍 [DEBUG] Sending initial vision request...');
+      var response = await model.generateContent(initialContent);
+      print('🔍 [DEBUG] Initial response received');
+      print(
+        '🔍 [DEBUG] Has function calls: ${response.functionCalls.isNotEmpty}',
+      );
+
+      int loopCount = 0;
+      const maxLoops = 5;
+
+      while (response.functionCalls.isNotEmpty && loopCount < maxLoops) {
+        loopCount++;
+        print('🔍 [DEBUG] Tool loop #$loopCount started');
+        print(
+          '🔍 [DEBUG] Function calls count: ${response.functionCalls.length}',
+        );
+
+        final functionResponseParts = <Part>[];
+
+        for (final functionCall in response.functionCalls) {
+          print('🔍 [DEBUG] Executing tool: ${functionCall.name}');
+          print('🔍 [DEBUG] Tool args: ${functionCall.args}');
+
+          print(
+            '🔍 [DEBUG TIMING] Starting tool execution at: ${DateTime.now().toIso8601String()}',
+          );
+          final toolResult = await ToolExecutor.execute(
+            functionCall.name,
+            functionCall.args,
+          );
+          print(
+            '🔍 [DEBUG TIMING] Tool execution completed in: ${DateTime.now().difference(_toolStartTime).inMilliseconds}ms',
+          );
+
+          print('🔍 [DEBUG] Tool execution result: $toolResult');
+          print('🔍 [DEBUG] Tool success: ${toolResult['success']}');
+
+          // Add function response as Part
+          functionResponseParts.add(
+            FunctionResponse(functionCall.name, toolResult),
+          );
+        }
+
+        // ⭐ FUNCTION TO WAIT FOR APP TO BE ACTIVE
+        Future<void> ensureAppIsActive() async {
+          // Check current state
+          var currentState = WidgetsBinding.instance.lifecycleState;
+          print('🔍 [DEBUG LIFECYCLE] Current app state: $currentState');
+
+          // If inactive, wait for resume
+          if (currentState == AppLifecycleState.inactive) {
+            print(
+              '🔍 [DEBUG LIFECYCLE] App is inactive, waiting for resume...',
+            );
+
+            final completer = Completer<void>();
+            final observer = _AppLifecycleObserver(completer);
+            WidgetsBinding.instance.addObserver(observer);
+
+            try {
+              await completer.future.timeout(
+                const Duration(seconds: 2),
+                onTimeout: () {
+                  print(
+                    '🔍 [DEBUG LIFECYCLE] Timeout waiting for app to resume',
+                  );
+                  if (!completer.isCompleted) {
+                    completer.complete();
+                  }
+                },
+              );
+            } finally {
+              WidgetsBinding.instance.removeObserver(observer);
+            }
+
+            // Check state again after waiting
+            print(
+              '🔍 [DEBUG LIFECYCLE] After wait, app state: ${WidgetsBinding.instance.lifecycleState}',
+            );
+          }
+        }
+
+        // After tool execution
+        print('🔍 [DEBUG] Sending function responses back to API...');
+        print(
+          '🔍 [DEBUG] Function response parts count: ${functionResponseParts.length}',
+        );
+
+        try {
+          final connectivityResult = await Connectivity().checkConnectivity();
+          print('🔍 [DEBUG NETWORK] Connectivity: $connectivityResult');
+
+          // ⭐ NEW: Check state - if inactive, DON'T WAIT, just give up
+          final currentState = WidgetsBinding.instance.lifecycleState;
+          print('🔍 [DEBUG LIFECYCLE] Current app state: $currentState');
+
+          if (currentState == AppLifecycleState.inactive) {
+            print(
+              '🔍 [DEBUG LIFECYCLE] App is inactive - CANNOT send function response',
+            );
+            print('🔍 [DEBUG LIFECYCLE] Skipping API call to preserve quota');
+
+            // Return a simple success message without trying API
+            return 'Call initiated successfully!';
+          }
+
+          // Only try API call if app is active
+          print('🔍 [DEBUG LIFECYCLE] App is active, proceeding with API call');
+          response = await model.generateContent([
+            Content.model(functionResponseParts),
+          ]);
+          print('🔍 [DEBUG] Function response accepted by API');
+        } catch (e) {
+          print('🔍 [DEBUG] ❌ ERROR sending function response: $e');
+          print('🔍 [DEBUG] Error type: ${e.runtimeType}');
+          rethrow;
+        }
+      }
+
+      final text = response.text;
+      print('🔍 [DEBUG] Final response text length: ${text?.length ?? 0}');
+
+      if (text == null || text.trim().isEmpty) {
+        return 'Action completed successfully.';
+      }
+
+      return text;
+    } catch (e) {
+      print('🔍 [DEBUG TIMING] ❌ ERROR in vision+tool call: $e');
+      print('🔍 [DEBUG TIMING] Error type: ${e.runtimeType}');
+      print(
+        '🔍 [DEBUG TIMING] Current time: ${DateTime.now().toIso8601String()}',
+      );
+      print(
+        '🔍 [DEBUG TIMING] Time since tool execution started: ${DateTime.now().difference(_toolStartTime).inMilliseconds}ms',
+      );
+
+      // Check if app is in foreground (though Flutter can't directly know this)
+      print(
+        '🔍 [DEBUG TIMING] Widgets binding initialized: ${WidgetsBinding.instance.lifecycleState}',
+      );
+      rethrow;
+    }
+  }
+
+  int _parseRetrySecondsFromError(String error) {
+    final match = RegExp(r'retry in (\d+)').firstMatch(error);
+    if (match != null) {
+      return int.tryParse(match.group(1) ?? '60') ?? 60;
+    }
+
+    final match2 = RegExp(r'retry in ([\d.]+)s').firstMatch(error);
+    if (match2 != null) {
+      final seconds = double.tryParse(match2.group(1) ?? '60') ?? 60;
+      return seconds.ceil();
+    }
+
+    return 60;
+  }
+
+  bool _isQuotaError(String error) {
+    return error.contains('quota') ||
+        error.contains('429') ||
+        error.contains('RESOURCE_EXHAUSTED') ||
+        error.contains('exceeded') ||
+        error.contains('rate limit');
+  }
+
+  bool _isModelNotFoundError(String error) {
+    return error.contains('not found') ||
+        error.contains('is not supported') ||
+        error.contains('ListModels');
+  }
+
+  @override
+  void resetSession() {
+    _chatSession = null;
+    _currentModelName = null;
+    print('🔄 Chat session reset');
+  }
+}
+
+class _AppLifecycleObserver extends WidgetsBindingObserver {
+  final Completer<void> completer;
+
+  _AppLifecycleObserver(this.completer);
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (!completer.isCompleted) {
+        print('🔍 [DEBUG LIFECYCLE] App resumed, completing waiter');
+        completer.complete();
+      }
+    }
+  }
+}
+import '../../domain/entities/message_entity.dart';
+
+class MessageModel extends MessageEntity {
+  const MessageModel({
+    required super.id,
+    required super.content,
+    required super.role,
+    required super.timestamp,
+  });
+
+  factory MessageModel.fromEntity(MessageEntity entity) {
+    return MessageModel(
+      id: entity.id,
+      content: entity.content,
+      role: entity.role,
+      timestamp: entity.timestamp,
+    );
+  }
+
+  factory MessageModel.create({
+    required String content,
+    required MessageRole role,
+  }) {
+    return MessageModel(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      content: content,
+      role: role,
+      timestamp: DateTime.now(),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'content': content,
+      'role': role.toString(),
+      'timestamp': timestamp.toIso8601String(),
+    };
+  }
+
+  factory MessageModel.fromJson(Map<String, dynamic> json) {
+    return MessageModel(
+      id: json['id'],
+      content: json['content'],
+      role: MessageRole.values.firstWhere((e) => e.toString() == json['role']),
+      timestamp: DateTime.parse(json['timestamp']),
+    );
+  }
+}
+import 'dart:async';
+import 'dart:io'; // ✅ NEW
+import 'package:dartz/dartz.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:flutter_tts/flutter_tts.dart';
+import '../../core/errors/failures.dart';
+import '../../core/constants/app_constants.dart';
+import '../../domain/entities/message_entity.dart';
+import '../../domain/repositories/ai_repository.dart';
+import '../datasources/remote/ai_remote_datasource.dart';
+import '../datasources/local/ai_local_datasource.dart';
+import '../models/message_model.dart';
+
+class AIRepositoryImpl implements AIRepository {
+  final AIRemoteDataSource remoteDataSource;
+  final AILocalDataSource localDataSource;
+
+  // ── Speech services (unchanged) ────────────────────────────────
+  late final stt.SpeechToText _speech;
+  late final FlutterTts _tts;
+
+  // ── Stream for listening state (unchanged) ─────────────────────
+  final _listeningController = StreamController<bool>.broadcast();
+
+  AIRepositoryImpl({
+    required this.remoteDataSource,
+    required this.localDataSource,
+  }) {
+    _speech = stt.SpeechToText();
+    _tts = FlutterTts();
+    _initTTS();
+  }
+
+  // ── TTS init (unchanged) ───────────────────────────────────────
+  Future<void> _initTTS() async {
+    await _tts.setLanguage("en-US");
+    await _tts.setSpeechRate(AppConstants.speechRate);
+    await _tts.setPitch(AppConstants.pitch);
+  }
+
+  // ── listenForSpeech (unchanged) ────────────────────────────────
+  @override
+  Future<Either<Failure, String>> listenForSpeech() async {
+    try {
+      bool available = await _speech.initialize();
+      if (!available) {
+        return Left(
+          SpeechRecognitionFailure('Speech recognition not available'),
+        );
+      }
+
+      _listeningController.add(true);
+
+      Completer<String> completer = Completer();
+
+      await _speech.listen(
+        onResult: (result) {
+          if (result.finalResult && !completer.isCompleted) {
+            completer.complete(result.recognizedWords);
+          }
+        },
+        listenFor: AppConstants.listenDuration,
+        pauseFor: AppConstants.pauseDuration,
+      );
+
+      String result = await completer.future;
+      _listeningController.add(false);
+
+      return Right(result);
+    } catch (e) {
+      _listeningController.add(false);
+      return Left(SpeechRecognitionFailure(e.toString()));
+    }
+  }
+
+  // ── stopListening (unchanged) ──────────────────────────────────
+  @override
+  Future<Either<Failure, void>> stopListening() async {
+    try {
+      await _speech.stop();
+      _listeningController.add(false);
+      return const Right(null);
+    } catch (e) {
+      return Left(SpeechRecognitionFailure(e.toString()));
+    }
+  }
+
+  // ── speakText (unchanged) ──────────────────────────────────────
+  @override
+  Future<Either<Failure, void>> speakText(String text) async {
+    try {
+      await _tts.speak(text);
+      return const Right(null);
+    } catch (e) {
+      return Left(TTSFailure(e.toString()));
+    }
+  }
+
+  // ── stopSpeaking (unchanged) ───────────────────────────────────
+  @override
+  Future<Either<Failure, void>> stopSpeaking() async {
+    try {
+      await _tts.stop();
+      return const Right(null);
+    } catch (e) {
+      return Left(TTSFailure(e.toString()));
+    }
+  }
+
+  // ── getAIResponse (unchanged) ──────────────────────────────────
+  @override
+  Future<Either<Failure, MessageEntity>> getAIResponse(String query) async {
+    try {
+      final aiResponse = await remoteDataSource.getAIResponse(query);
+
+      final message = MessageModel.create(
+        content: aiResponse,
+        role: MessageRole.assistant,
+      );
+
+      await localDataSource.saveMessage(message);
+
+      return Right(message);
+    } catch (e) {
+      return Left(ServerFailure(e.toString()));
+    }
+  }
+
+  // ✅ NEW: getAIResponseWithImage ────────────────────────────────
+  // Calls vision datasource, saves AI reply to local cache,
+  // returns MessageEntity to domain layer.
+  // Note: we intentionally do NOT save the image file locally —
+  // only the text content of the conversation is persisted.
+  @override
+  Future<Either<Failure, MessageEntity>> getAIResponseWithImage(
+    String query,
+    File imageFile,
+  ) async {
+    try {
+      final aiResponse = await remoteDataSource.getAIResponseWithImage(
+        query,
+        imageFile,
+      );
+
+      final message = MessageModel.create(
+        content: aiResponse,
+        role: MessageRole.assistant,
+      );
+
+      // Save AI reply to local chat history
+      await localDataSource.saveMessage(message);
+
+      return Right(message);
+    } catch (e) {
+      return Left(ServerFailure(e.toString()));
+    }
+  }
+
+  // ── getChatHistory (unchanged) ─────────────────────────────────
+  @override
+  Future<Either<Failure, List<MessageEntity>>> getChatHistory() async {
+    try {
+      final messages = await localDataSource.getChatHistory();
+      return Right(messages);
+    } catch (e) {
+      return Left(ServerFailure(e.toString()));
+    }
+  }
+
+  // ── clearChatHistory (unchanged) ───────────────────────────────
+  @override
+  Future<Either<Failure, void>> clearChatHistory() async {
+    try {
+      await localDataSource.clearChatHistory();
+      return const Right(null);
+    } catch (e) {
+      return Left(ServerFailure(e.toString()));
+    }
+  }
+
+  // ── listeningStream (unchanged) ────────────────────────────────
+  @override
+  Stream<bool> get listeningStream => _listeningController.stream;
+
+  // ── dispose (unchanged) ────────────────────────────────────────
+  void dispose() {
+    _listeningController.close();
+    _tts.stop();
+  }
+}
+import 'package:equatable/equatable.dart';
+
+enum MessageRole { user, assistant, system }
+
+class MessageEntity extends Equatable {
+  final String id;
+  final String content;
+  final MessageRole role;
+  final DateTime timestamp;
+
+  const MessageEntity({
+    required this.id,
+    required this.content,
+    required this.role,
+    required this.timestamp,
+  });
+
+  @override
+  List<Object?> get props => [id, content, role, timestamp];
+}
+// lib/domain/entities/tool_result_entity.dart
+
+class ToolResultEntity {
+  final String toolName;
+  final Map<String, dynamic> result;
+  final bool success;
+  final String? errorMessage;
+
+  const ToolResultEntity({
+    required this.toolName,
+    required this.result,
+    required this.success,
+    this.errorMessage,
+  });
+}
+import 'dart:io'; // ✅ NEW
+import 'package:dartz/dartz.dart';
+import '../../core/errors/failures.dart';
+import '../entities/message_entity.dart';
+
+abstract class AIRepository {
+  // ── Speech to Text (unchanged) ─────────────────────────────────
+  Future<Either<Failure, String>> listenForSpeech();
+  Future<Either<Failure, void>> stopListening();
+  Stream<bool> get listeningStream;
+
+  // ── Text to Speech (unchanged) ─────────────────────────────────
+  Future<Either<Failure, void>> speakText(String text);
+  Future<Either<Failure, void>> stopSpeaking();
+
+  // ── AI Chat (unchanged) ────────────────────────────────────────
+  Future<Either<Failure, MessageEntity>> getAIResponse(String query);
+  Future<Either<Failure, List<MessageEntity>>> getChatHistory();
+  Future<Either<Failure, void>> clearChatHistory();
+
+  // ✅ NEW: Vision — image + text query
+  Future<Either<Failure, MessageEntity>> getAIResponseWithImage(
+    String query,
+    File imageFile,
+  );
+}
+import 'package:dartz/dartz.dart';
+import '../../core/errors/failures.dart';
+import '../../core/usecases/usecase.dart';
+import '../repositories/ai_repository.dart';
+
+class ClearChatHistoryUseCase implements UseCase<void, NoParams> {
+  final AIRepository repository;
+
+  ClearChatHistoryUseCase(this.repository);
+
+  @override
+  Future<Either<Failure, void>> call(NoParams params) async {
+    return await repository.clearChatHistory();
+  }
+}
+import 'dart:io';
+import 'package:dartz/dartz.dart';
+import '../../core/errors/failures.dart';
+import '../../core/usecases/usecase.dart';
+import '../entities/message_entity.dart';
+import '../repositories/ai_repository.dart';
+
+class GetAIResponseUseCase implements UseCase<MessageEntity, String> {
+  final AIRepository repository;
+
+  GetAIResponseUseCase(this.repository);
+
+  // ── Text-only call ─────────────────────────────────────────────
+  @override
+  Future<Either<Failure, MessageEntity>> call(String query) async {
+    print('🔧 [UseCase] call() → Routing to repository.getAIResponse()');
+    print('   📝 Query: "$query"');
+    return await repository.getAIResponse(query);
+  }
+
+  // ── Image + text call ──────────────────────────────────────────
+  Future<Either<Failure, MessageEntity>> callWithImage(
+    String query,
+    File imageFile,
+  ) async {
+    print(
+      '🔧 [UseCase] callWithImage() → Routing to repository.getAIResponseWithImage()',
+    );
+    print('   📝 Query: "$query"');
+    print('   🖼️  Image: ${imageFile.path}');
+    return await repository.getAIResponseWithImage(query, imageFile);
+  }
+}
+
+// ── GetChatHistoryUseCase ──────────────────────────────────────
+class GetChatHistoryUseCase implements UseCase<List<MessageEntity>, NoParams> {
+  final AIRepository repository;
+
+  GetChatHistoryUseCase(this.repository);
+
+  @override
+  Future<Either<Failure, List<MessageEntity>>> call(NoParams params) async {
+    return await repository.getChatHistory();
+  }
+}
+import 'package:dartz/dartz.dart';
+import '../../core/errors/failures.dart';
+import '../../core/usecases/usecase.dart';
+import '../repositories/ai_repository.dart';
+
+class ListenToSpeechUseCase implements UseCase<String, NoParams> {
+  final AIRepository repository;
+
+  ListenToSpeechUseCase(this.repository);
+
+  @override
+  Future<Either<Failure, String>> call(NoParams params) async {
+    return await repository.listenForSpeech();
+  }
+}
+
+class StopListeningUseCase implements UseCase<void, NoParams> {
+  final AIRepository repository;
+
+  StopListeningUseCase(this.repository);
+
+  @override
+  Future<Either<Failure, void>> call(NoParams params) async {
+    return await repository.stopListening();
+  }
+}
+import 'package:dartz/dartz.dart';
+import '../../core/errors/failures.dart';
+import '../../core/usecases/usecase.dart';
+import '../repositories/ai_repository.dart';
+
+class SpeakTextUseCase implements UseCase<void, String> {
+  final AIRepository repository;
+
+  SpeakTextUseCase(this.repository);
+
+  @override
+  Future<Either<Failure, void>> call(String text) async {
+    return await repository.speakText(text);
+  }
+}
+
+class StopSpeakingUseCase implements UseCase<void, NoParams> {
+  final AIRepository repository;
+
+  StopSpeakingUseCase(this.repository);
+
+  @override
+  Future<Either<Failure, void>> call(NoParams params) async {
+    return await repository.stopSpeaking();
+  }
+}
+import 'dart:io';
+
+import 'package:equatable/equatable.dart';
+import 'package:fl_ai/domain/usecases/clear_chat_history_usecase.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import '../../../core/usecases/usecase.dart';
+import '../../../domain/entities/message_entity.dart';
+import '../../../domain/usecases/get_ai_response_usecase.dart';
+import '../../../domain/usecases/speak_text_usecase.dart';
+import '../../../data/models/message_model.dart';
+
+part 'ai_chat_event.dart';
+part 'ai_chat_state.dart';
+
+class AIChatBloc extends Bloc<AIChatEvent, AIChatState> {
+  final GetAIResponseUseCase getAIResponse;
+  final GetChatHistoryUseCase getChatHistory;
+  final ClearChatHistoryUseCase clearChatHistory;
+  final SpeakTextUseCase speakText;
+
+  AIChatBloc({
+    required this.getAIResponse,
+    required this.getChatHistory,
+    required this.clearChatHistory,
+    required this.speakText,
+  }) : super(AIChatInitial()) {
+    on<SendMessageEvent>(_onSendMessage);
+    on<SendMessageWithImageEvent>(_onSendMessageWithImage);
+    on<LoadChatHistoryEvent>(_onLoadChatHistory);
+    on<ClearChatHistoryEvent>(_onClearChatHistory);
+    on<AddMessageEvent>(_onAddMessage);
+  }
+
+  // ✅ Helper to safely truncate text for logging
+  String _truncateForLog(String text, [int maxLength = 50]) {
+    if (text.length <= maxLength) return text;
+    return '${text.substring(0, maxLength)}...';
+  }
+
+  // ✅ IMPROVED: Better markdown stripping for TTS
+  String _stripMarkdown(String text) {
+    String cleaned = text;
+
+    // Remove bold (**text** or __text__)
+    cleaned = cleaned.replaceAll(RegExp(r'\*\*'), '');
+    cleaned = cleaned.replaceAll(RegExp(r'__'), '');
+
+    // Remove italic (*text* or _text_)
+    cleaned = cleaned.replaceAll(RegExp(r'(?<!\*)\*(?!\*)'), '');
+    cleaned = cleaned.replaceAll(RegExp(r'(?<!_)_(?!_)'), '');
+
+    // Remove code blocks (```text```)
+    cleaned = cleaned.replaceAll(RegExp(r'```[^`]*```'), '');
+
+    // Remove inline code (`text`)
+    cleaned = cleaned.replaceAll(RegExp(r'`([^`]+)`'), r'$1');
+
+    // Remove strikethrough (~~text~~)
+    cleaned = cleaned.replaceAll(RegExp(r'~~([^~]+)~~'), r'$1');
+
+    // Remove links [text](url) -> keep only text
+    cleaned = cleaned.replaceAll(RegExp(r'\[([^\]]+)\]\([^)]+\)'), r'$1');
+
+    // Remove headers (# ## ### etc.)
+    cleaned = cleaned.replaceAll(RegExp(r'^#+\s+', multiLine: true), '');
+
+    // Remove list markers (- * + or 1. 2. etc.)
+    cleaned = cleaned.replaceAll(RegExp(r'^\s*[-*+]\s+', multiLine: true), '');
+    cleaned = cleaned.replaceAll(RegExp(r'^\s*\d+\.\s+', multiLine: true), '');
+
+    // Remove horizontal rules (---, ***, ___)
+    cleaned = cleaned.replaceAll(RegExp(r'^[-*_]{3,}$', multiLine: true), '');
+
+    // Clean up multiple spaces
+    cleaned = cleaned.replaceAll(RegExp(r'\s+'), ' ');
+
+    return cleaned.trim();
+  }
+
+  Future<void> _onSendMessage(
+    SendMessageEvent event,
+    Emitter<AIChatState> emit,
+  ) async {
+    print('\n🎯 [BLoC] Event: SendMessageEvent (TEXT-ONLY)');
+    print('   📝 Message: "${event.message}"');
+    print('   🚫 Image: NONE');
+    print('   🔊 Should speak: ${event.shouldSpeak}');
+
+    final currentState = state;
+    List<MessageEntity> currentMessages = [];
+
+    if (currentState is AIChatLoaded) {
+      currentMessages = currentState.messages;
+    }
+
+    final userMessage = MessageModel.create(
+      content: event.message,
+      role: MessageRole.user,
+    );
+
+    emit(
+      AIChatLoaded(messages: [...currentMessages, userMessage], isTyping: true),
+    );
+
+    print('   🔄 Calling: getAIResponse.call() → TEXT MODEL');
+    final result = await getAIResponse(event.message);
+
+    result.fold(
+      (failure) {
+        print('   ❌ Error: ${failure.message}\n');
+        emit(AIChatError(failure.message));
+      },
+      (aiMessage) {
+        print(
+          '   ✅ Response received (${aiMessage.content.length} chars): "${_truncateForLog(aiMessage.content)}"\n',
+        );
+        final updatedMessages = [...currentMessages, userMessage, aiMessage];
+        emit(AIChatLoaded(messages: updatedMessages, isTyping: false));
+
+        if (event.shouldSpeak) {
+          final cleanText = _stripMarkdown(aiMessage.content);
+          print(
+            '   🔊 TTS Original: "${_truncateForLog(aiMessage.content, 100)}"',
+          );
+          print('   🔊 TTS Cleaned: "${_truncateForLog(cleanText, 100)}"');
+          speakText(cleanText);
+        }
+      },
+    );
+  }
+
+  Future<void> _onSendMessageWithImage(
+    SendMessageWithImageEvent event,
+    Emitter<AIChatState> emit,
+  ) async {
+    print('\n🎯 [BLoC] Event: SendMessageWithImageEvent (VISION)');
+    print('   📝 Message: "${event.message}"');
+    print('   🖼️  Image: ${event.imageFile.path}');
+    print('   📏 Image size: ${await event.imageFile.length()} bytes');
+    print('   🔊 Should speak: ${event.shouldSpeak}');
+
+    final currentState = state;
+    List<MessageEntity> currentMessages = [];
+
+    if (currentState is AIChatLoaded) {
+      currentMessages = currentState.messages;
+    }
+
+    final userMessage = MessageModel.create(
+      content: '📷 ${event.message}',
+      role: MessageRole.user,
+    );
+
+    emit(
+      AIChatLoaded(messages: [...currentMessages, userMessage], isTyping: true),
+    );
+
+    print('   🔄 Calling: getAIResponse.callWithImage() → VISION MODEL');
+    final result = await getAIResponse.callWithImage(
+      event.message,
+      event.imageFile,
+    );
+
+    result.fold(
+      (failure) {
+        print('   ❌ Error: ${failure.message}\n');
+        emit(AIChatError(failure.message));
+      },
+      (aiMessage) {
+        print(
+          '   ✅ Response received (${aiMessage.content.length} chars): "${_truncateForLog(aiMessage.content)}"\n',
+        );
+        final updatedMessages = [...currentMessages, userMessage, aiMessage];
+
+        emit(AIChatLoaded(messages: updatedMessages, isTyping: false));
+
+        if (event.shouldSpeak) {
+          final cleanText = _stripMarkdown(aiMessage.content);
+          print(
+            '   🔊 TTS Original: "${_truncateForLog(aiMessage.content, 100)}"',
+          );
+          print('   🔊 TTS Cleaned: "${_truncateForLog(cleanText, 100)}"');
+          speakText(cleanText);
+        }
+      },
+    );
+  }
+
+  Future<void> _onLoadChatHistory(
+    LoadChatHistoryEvent event,
+    Emitter<AIChatState> emit,
+  ) async {
+    final currentState = state;
+
+    if (currentState is AIChatLoaded && currentState.messages.isNotEmpty) {
+      print(
+        '📋 [BLoC] Chat already loaded (${currentState.messages.length} messages), skipping reload',
+      );
+      return;
+    }
+
+    if (currentState is! AIChatLoaded) {
+      emit(AIChatLoading());
+    }
+
+    final result = await getChatHistory(NoParams());
+
+    result.fold((failure) => emit(AIChatError(failure.message)), (messages) {
+      print('📋 [BLoC] Loaded ${messages.length} messages from storage');
+      emit(AIChatLoaded(messages: messages));
+    });
+  }
+
+  Future<void> _onClearChatHistory(
+    ClearChatHistoryEvent event,
+    Emitter<AIChatState> emit,
+  ) async {
+    final result = await clearChatHistory(NoParams());
+
+    result.fold(
+      (failure) => emit(AIChatError(failure.message)),
+      (_) => emit(const AIChatLoaded(messages: [])),
+    );
+  }
+
+  void _onAddMessage(AddMessageEvent event, Emitter<AIChatState> emit) {
+    final currentState = state;
+    if (currentState is AIChatLoaded) {
+      emit(AIChatLoaded(messages: [...currentState.messages, event.message]));
+    }
+  }
+}
+part of 'ai_chat_bloc.dart';
+
+abstract class AIChatEvent extends Equatable {
+  const AIChatEvent();
+
+  @override
+  List<Object?> get props => [];
+}
+
+// ── Text-only query (unchanged) ────────────────────────────────────
+class SendMessageEvent extends AIChatEvent {
+  final String message;
+  final bool shouldSpeak;
+
+  const SendMessageEvent({required this.message, this.shouldSpeak = true});
+
+  @override
+  List<Object?> get props => [message, shouldSpeak];
+}
+
+// ✅ NEW: Image + text query ────────────────────────────────────────
+// Triggered by CameraPage after user speaks a query and takes a photo.
+// imageFile  = the captured photo from CameraX
+// message    = the spoken/typed question about the image
+// shouldSpeak = whether TTS should read the AI response aloud
+class SendMessageWithImageEvent extends AIChatEvent {
+  final String message;
+  final File imageFile;
+  final bool shouldSpeak;
+
+  const SendMessageWithImageEvent({
+    required this.message,
+    required this.imageFile,
+    this.shouldSpeak = true,
+  });
+
+  @override
+  List<Object?> get props => [message, imageFile, shouldSpeak];
+}
+
+// ── Load chat history (unchanged) ──────────────────────────────────
+class LoadChatHistoryEvent extends AIChatEvent {
+  const LoadChatHistoryEvent();
+}
+
+// ── Clear chat history (unchanged) ─────────────────────────────────
+class ClearChatHistoryEvent extends AIChatEvent {
+  const ClearChatHistoryEvent();
+}
+
+// ── Add a single message to state (unchanged) ──────────────────────
+class AddMessageEvent extends AIChatEvent {
+  final MessageEntity message;
+
+  const AddMessageEvent(this.message);
+
+  @override
+  List<Object?> get props => [message];
+}
+part of 'ai_chat_bloc.dart';
+
+abstract class AIChatState extends Equatable {
+  const AIChatState();
+
+  @override
+  List<Object?> get props => [];
+}
+
+// ── Initial state ──────────────────────────────────────────────────
+class AIChatInitial extends AIChatState {}
+
+// ── Loading (fetching history etc.) ───────────────────────────────
+class AIChatLoading extends AIChatState {}
+
+// ── Loaded — main state with messages ─────────────────────────────
+// isTyping = true  → show "AI is thinking..." bubble
+// isTyping = false → normal chat view
+class AIChatLoaded extends AIChatState {
+  final List<MessageEntity> messages;
+  final bool isTyping;
+
+  const AIChatLoaded({required this.messages, this.isTyping = false});
+
+  @override
+  List<Object?> get props => [messages, isTyping];
+}
+
+// ── Error state ────────────────────────────────────────────────────
+class AIChatError extends AIChatState {
+  final String message;
+
+  const AIChatError(this.message);
+
+  @override
+  List<Object?> get props => [message];
+}
+import 'dart:io';
+import 'package:camera/camera.dart';
+import 'package:equatable/equatable.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+part 'camera_event.dart';
+part 'camera_state.dart';
+
+class CameraBloc extends Bloc<CameraEvent, CameraState> {
+  CameraController? _controller;
+  List<CameraDescription> _cameras = [];
+  int _currentCameraIndex = 0;
+
+  CameraBloc() : super(CameraInitial()) {
+    on<InitializeCameraEvent>(_onInitializeCamera);
+    on<SwitchCameraEvent>(_onSwitchCamera);
+    on<CapturePhotoEvent>(_onCapturePhoto);
+    on<DisposeCameraEvent>(_onDisposeCamera);
+  }
+
+  CameraController? get controller => _controller;
+
+  Future<void> _onInitializeCamera(
+    InitializeCameraEvent event,
+    Emitter<CameraState> emit,
+  ) async {
+    try {
+      if (_controller != null && _controller!.value.isInitialized) {
+        emit(CameraReady(controller: _controller!));
+        return;
+      }
+
+      emit(CameraLoading());
+
+      if (_cameras.isEmpty) {
+        _cameras = await availableCameras();
+      }
+
+      _currentCameraIndex = _cameras.indexWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+      );
+      if (_currentCameraIndex == -1) _currentCameraIndex = 0;
+
+      await _initController(_cameras[_currentCameraIndex]);
+
+      emit(CameraReady(controller: _controller!));
+    } catch (e) {
+      emit(CameraError(e.toString()));
+    }
+  }
+
+  Future<void> _onSwitchCamera(
+    SwitchCameraEvent event,
+    Emitter<CameraState> emit,
+  ) async {
+    try {
+      emit(CameraLoading());
+
+      await _controller?.dispose();
+
+      _currentCameraIndex = (_currentCameraIndex + 1) % _cameras.length;
+
+      await _initController(_cameras[_currentCameraIndex]);
+
+      emit(CameraReady(controller: _controller!));
+    } catch (e) {
+      emit(CameraError(e.toString()));
+    }
+  }
+
+  Future<void> _onCapturePhoto(
+    CapturePhotoEvent event,
+    Emitter<CameraState> emit,
+  ) async {
+    try {
+      if (_controller == null || !_controller!.value.isInitialized) {
+        emit(const CameraError('Camera not ready'));
+        return;
+      }
+
+      final currentState = state;
+
+      // ✅ Pause preview BEFORE capture to reduce buffer pressure
+      try {
+        await _controller!.pausePreview();
+      } catch (e) {
+        print('⚠️ Could not pause preview: $e');
+      }
+
+      // Emit capturing state
+      if (currentState is CameraReady) {
+        emit(CameraCapturing(controller: _controller!));
+      }
+
+      final XFile file = await _controller!.takePicture();
+      final imageFile = File(file.path);
+
+      // ✅ Resume preview AFTER capture
+      try {
+        await _controller!.resumePreview();
+      } catch (e) {
+        print('⚠️ Could not resume preview: $e');
+      }
+
+      emit(CameraPhotoCaptured(controller: _controller!, imageFile: imageFile));
+    } catch (e) {
+      // Make sure to resume preview even if capture fails
+      try {
+        await _controller?.resumePreview();
+      } catch (_) {}
+      emit(CameraError(e.toString()));
+    }
+  }
+
+  Future<void> _onDisposeCamera(
+    DisposeCameraEvent event,
+    Emitter<CameraState> emit,
+  ) async {
+    await _controller?.dispose();
+    _controller = null;
+    emit(CameraInitial());
+  }
+
+  /// ✅ Optimized initialization
+  Future<void> _initController(CameraDescription camera) async {
+    _controller = CameraController(
+      camera,
+      ResolutionPreset.low, // Low resolution for preview
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.jpeg,
+    );
+    await _controller!.initialize();
+  }
+
+  @override
+  Future<void> close() async {
+    await _controller?.dispose();
+    return super.close();
+  }
+}
+part of 'camera_bloc.dart';
+
+abstract class CameraEvent extends Equatable {
+  const CameraEvent();
+
+  @override
+  List<Object> get props => [];
+}
+
+class InitializeCameraEvent extends CameraEvent {}
+
+class SwitchCameraEvent extends CameraEvent {}
+
+class CapturePhotoEvent extends CameraEvent {}
+
+class DisposeCameraEvent extends CameraEvent {}
+part of 'camera_bloc.dart';
+
+abstract class CameraState extends Equatable {
+  const CameraState();
+
+  @override
+  List<Object?> get props => [];
+}
+
+class CameraInitial extends CameraState {}
+
+class CameraLoading extends CameraState {}
+
+class CameraReady extends CameraState {
+  final CameraController controller;
+
+  const CameraReady({required this.controller});
+
+  @override
+  List<Object?> get props => [controller];
+}
+
+class CameraCapturing extends CameraState {
+  final CameraController controller;
+
+  const CameraCapturing({required this.controller});
+
+  @override
+  List<Object?> get props => [controller];
+}
+
+class CameraPhotoCaptured extends CameraState {
+  final CameraController controller;
+  final File imageFile;
+
+  const CameraPhotoCaptured({
+    required this.controller,
+    required this.imageFile,
+  });
+
+  @override
+  List<Object?> get props => [controller, imageFile];
+}
+
+class CameraError extends CameraState {
+  final String message;
+
+  const CameraError(this.message);
+
+  @override
+  List<Object?> get props => [message];
+}
+import 'package:equatable/equatable.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import '../../../core/usecases/usecase.dart';
+import '../../../domain/usecases/listen_to_speech_usecase.dart';
+import '../../../domain/usecases/speak_text_usecase.dart';
+
+// These must be part of this file
+part 'speech_event.dart';
+part 'speech_state.dart';
+
+class SpeechBloc extends Bloc<SpeechEvent, SpeechState> {
+  final ListenToSpeechUseCase listenToSpeech;
+  final StopListeningUseCase stopListening;
+  final SpeakTextUseCase speakText;
+  final StopSpeakingUseCase stopSpeaking;
+
+  SpeechBloc({
+    required this.listenToSpeech,
+    required this.stopListening,
+    required this.speakText,
+    required this.stopSpeaking,
+  }) : super(SpeechInitial()) {
+    on<StartListeningEvent>(_onStartListening);
+    on<StopListeningEvent>(_onStopListening);
+    on<SpeakTextEvent>(_onSpeakText);
+    on<StopSpeakingEvent>(_onStopSpeaking);
+    on<SpeechResultEvent>(_onSpeechResult);
+    on<ListeningStateChangedEvent>(_onListeningStateChanged);
+  }
+
+  Future<void> _onStartListening(
+    StartListeningEvent event,
+    Emitter<SpeechState> emit,
+  ) async {
+    print('🎤 [Speech] Starting to listen...');
+
+    // ✅ CRITICAL FIX: Stop TTS before starting to listen
+    // This prevents the mic from picking up the AI's own voice
+    print('🔇 [Speech] Stopping TTS to prevent interference...');
+    await stopSpeaking(NoParams());
+
+    emit(const SpeechListening());
+
+    final result = await listenToSpeech(NoParams());
+
+    result.fold(
+      (failure) {
+        print('❌ [Speech] Error: ${failure.message}');
+        emit(SpeechError(failure.message));
+      },
+      (text) {
+        print('✅ [Speech] Recognized: "$text"');
+        add(SpeechResultEvent(text));
+      },
+    );
+  }
+
+  Future<void> _onStopListening(
+    StopListeningEvent event,
+    Emitter<SpeechState> emit,
+  ) async {
+    print('🛑 [Speech] Stopping listening...');
+    await stopListening(NoParams());
+    emit(SpeechIdle());
+  }
+
+  Future<void> _onSpeakText(
+    SpeakTextEvent event,
+    Emitter<SpeechState> emit,
+  ) async {
+    print(
+      '🔊 [Speech] Speaking: "${event.text.substring(0, event.text.length > 50 ? 50 : event.text.length)}..."',
+    );
+    emit(Speaking(event.text));
+
+    final result = await speakText(event.text);
+
+    result.fold(
+      (failure) {
+        print('❌ [Speech] TTS Error: ${failure.message}');
+        emit(SpeechError(failure.message));
+      },
+      (_) {
+        print('✅ [Speech] TTS finished');
+        emit(SpeechIdle());
+      },
+    );
+  }
+
+  Future<void> _onStopSpeaking(
+    StopSpeakingEvent event,
+    Emitter<SpeechState> emit,
+  ) async {
+    print('🔇 [Speech] Stopping TTS...');
+    await stopSpeaking(NoParams());
+    emit(SpeechIdle());
+  }
+
+  void _onSpeechResult(SpeechResultEvent event, Emitter<SpeechState> emit) {
+    print('📝 [Speech] Result: "${event.text}"');
+    emit(SpeechResult(event.text));
+  }
+
+  void _onListeningStateChanged(
+    ListeningStateChangedEvent event,
+    Emitter<SpeechState> emit,
+  ) {
+    if (event.isListening) {
+      print('🎤 [Speech] State changed: Listening');
+      emit(const SpeechListening());
+    } else {
+      print('⏸️ [Speech] State changed: Idle');
+      emit(SpeechIdle());
+    }
+  }
+}
+part of 'speech_bloc.dart'; // This should point to speech_bloc.dart, not itself
+
+abstract class SpeechEvent extends Equatable {
+  const SpeechEvent();
+
+  @override
+  List<Object> get props => [];
+}
+
+class StartListeningEvent extends SpeechEvent {}
+
+class StopListeningEvent extends SpeechEvent {}
+
+class SpeechResultEvent extends SpeechEvent {
+  final String text;
+
+  const SpeechResultEvent(this.text);
+
+  @override
+  List<Object> get props => [text];
+}
+
+class SpeakTextEvent extends SpeechEvent {
+  final String text;
+
+  const SpeakTextEvent(this.text);
+
+  @override
+  List<Object> get props => [text];
+}
+
+class StopSpeakingEvent extends SpeechEvent {}
+
+class ListeningStateChangedEvent extends SpeechEvent {
+  final bool isListening;
+
+  const ListeningStateChangedEvent(this.isListening);
+
+  @override
+  List<Object> get props => [isListening];
+}
+part of 'speech_bloc.dart';
+
+abstract class SpeechState extends Equatable {
+  const SpeechState();
+
+  @override
+  List<Object> get props => [];
+}
+
+class SpeechInitial extends SpeechState {}
+
+class SpeechListening extends SpeechState {
+  final String transcript;
+
+  const SpeechListening({this.transcript = ''});
+
+  @override
+  List<Object> get props => [transcript];
+}
+
+class SpeechProcessing extends SpeechState {
+  final String recognizedText;
+
+  const SpeechProcessing(this.recognizedText);
+
+  @override
+  List<Object> get props => [recognizedText];
+}
+
+class SpeechResult extends SpeechState {
+  final String text;
+
+  const SpeechResult(this.text);
+
+  @override
+  List<Object> get props => [text];
+}
+
+class Speaking extends SpeechState {
+  final String text;
+
+  const Speaking(this.text);
+
+  @override
+  List<Object> get props => [text];
+}
+
+class SpeechError extends SpeechState {
+  final String message;
+
+  const SpeechError(this.message);
+
+  @override
+  List<Object> get props => [message];
+}
+
+class SpeechIdle extends SpeechState {}
+import 'dart:io';
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import '../blocs/camera/camera_bloc.dart';
+import '../blocs/speech/speech_bloc.dart';
+import '../blocs/ai_chat/ai_chat_bloc.dart';
+import '../../domain/entities/message_entity.dart';
+import '../../data/models/message_model.dart';
+import '../../../injection_container.dart';
+
+class CameraPage extends StatefulWidget {
+  const CameraPage({super.key});
+
+  @override
+  State<CameraPage> createState() => _CameraPageState();
+}
+
+class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
+  late final AnimationController _pulseAnimation;
+  late final CameraBloc _cameraBloc;
+  late final SpeechBloc _speechBloc;
+  late final AIChatBloc _aiChatBloc;
+
+  final List<MessageEntity> _localMessages = [];
+
+  // ✅ Store last captured image for follow-ups
+  File? _lastCapturedImage;
+  bool _isVisionModeEnabled = false;
+  String? _pendingVoiceInput;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _pulseAnimation = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    )..repeat(reverse: true);
+
+    _cameraBloc = CameraBloc();
+    _speechBloc = sl<SpeechBloc>();
+    _aiChatBloc = sl<AIChatBloc>();
+
+    _cameraBloc.add(InitializeCameraEvent());
+  }
+
+  @override
+  void dispose() {
+    _pulseAnimation.dispose();
+    _cameraBloc.add(DisposeCameraEvent());
+    _cameraBloc.close();
+    super.dispose();
+  }
+
+  void _toggleVisionMode() {
+    setState(() {
+      _isVisionModeEnabled = !_isVisionModeEnabled;
+    });
+
+    if (_isVisionModeEnabled) {
+      print('🟢 [Camera] Vision mode ENABLED - will capture NEW image');
+    } else {
+      print(
+        '⚪ [Camera] Vision mode DISABLED - will use last image for follow-ups',
+      );
+    }
+  }
+
+  Future<void> _handleVoiceInput(String text) async {
+    if (text.isEmpty) return;
+
+    print('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    print('🎤 [Camera] Voice input: "$text"');
+    print('📷 [Camera] Vision mode: $_isVisionModeEnabled');
+    print('💾 [Camera] Last image: ${_lastCapturedImage?.path ?? "NONE"}');
+    print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+
+    final userMessage = MessageModel.create(
+      content: text,
+      role: MessageRole.user,
+    );
+    setState(() => _localMessages.add(userMessage));
+
+    if (_isVisionModeEnabled) {
+      // ✅ Capture NEW image
+      print('📸 [Camera] Capturing NEW image for: "$text"');
+      _pendingVoiceInput = text;
+      _cameraBloc.add(CapturePhotoEvent());
+    } else if (_lastCapturedImage != null) {
+      // ✅ Use LAST captured image for follow-up
+      print('🔄 [Camera] Using LAST image for follow-up: "$text"');
+      print('   🖼️  Image: ${_lastCapturedImage!.path}');
+      _sendVisionMessage(text, _lastCapturedImage!);
+    } else {
+      // ⚠️ No image yet - force capture
+      print('⚠️  [Camera] No image captured yet, forcing capture...');
+      _pendingVoiceInput = text;
+      _cameraBloc.add(CapturePhotoEvent());
+    }
+  }
+
+  Future<void> _sendVisionMessage(String text, File imageFile) async {
+    print('\n✅ [Camera] Sending VISION message:');
+    print('   📝 Text: "$text"');
+    print('   🖼️  Image: ${imageFile.path}');
+    print('   📦 Event: SendMessageWithImageEvent\n');
+
+    _aiChatBloc.add(
+      SendMessageWithImageEvent(
+        message: text,
+        imageFile: imageFile,
+        shouldSpeak: true,
+      ),
+    );
+
+    // ✅ Store image and reset vision mode
+    if (_isVisionModeEnabled) {
+      setState(() {
+        _lastCapturedImage = imageFile;
+        _isVisionModeEnabled = false;
+        _pendingVoiceInput = null;
+      });
+      print('💾 [Camera] Stored image for follow-ups');
+      print('🔄 [Camera] Vision mode auto-reset to OFF\n');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiBlocProvider(
+      providers: [
+        BlocProvider.value(value: _cameraBloc),
+        BlocProvider.value(value: _speechBloc),
+        BlocProvider.value(value: _aiChatBloc),
+      ],
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(
+          children: [
+            _buildCameraPreview(),
+            _buildTopBar(),
+            _buildFloatingChat(),
+            _buildVisionToggleButton(),
+            _buildBottomMicArea(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCameraPreview() {
+    return BlocConsumer<CameraBloc, CameraState>(
+      listener: (context, state) {
+        if (state is CameraPhotoCaptured) {
+          print('📷 [Camera] Photo captured: ${state.imageFile.path}');
+          if (_pendingVoiceInput != null) {
+            _sendVisionMessage(_pendingVoiceInput!, state.imageFile);
+          }
+        }
+      },
+      builder: (context, state) {
+        if (state is CameraReady ||
+            state is CameraCapturing ||
+            state is CameraPhotoCaptured) {
+          final controller = state is CameraReady
+              ? state.controller
+              : state is CameraCapturing
+              ? state.controller
+              : (state as CameraPhotoCaptured).controller;
+
+          return SizedBox.expand(child: CameraPreview(controller));
+        }
+
+        if (state is CameraLoading) {
+          return const Center(
+            child: CircularProgressIndicator(color: Colors.white),
+          );
+        }
+
+        if (state is CameraError) {
+          return Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.camera_alt, color: Colors.white54, size: 64),
+                const SizedBox(height: 16),
+                Text(
+                  'Camera Error:\n${state.message}',
+                  style: const TextStyle(color: Colors.white70),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          );
+        }
+
+        return const SizedBox.shrink();
+      },
+    );
+  }
+
+  Widget _buildTopBar() {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            _glassButton(
+              icon: Icons.arrow_back,
+              onTap: () => Navigator.pop(context),
+            ),
+
+            const Text(
+              'AI Camera',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                shadows: [Shadow(blurRadius: 4, color: Colors.black54)],
+              ),
+            ),
+
+            _glassButton(
+              icon: Icons.flip_camera_ios,
+              onTap: () => _cameraBloc.add(SwitchCameraEvent()),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _glassButton({required IconData icon, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.4),
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white24),
+        ),
+        child: Icon(icon, color: Colors.white, size: 22),
+      ),
+    );
+  }
+
+  Widget _buildFloatingChat() {
+    return BlocListener<AIChatBloc, AIChatState>(
+      listener: (context, state) {
+        if (state is AIChatLoaded && state.messages.isNotEmpty) {
+          final lastMsg = state.messages.last;
+          if (lastMsg.role == MessageRole.assistant) {
+            final alreadyExists = _localMessages.any((m) => m.id == lastMsg.id);
+            if (!alreadyExists) {
+              setState(() => _localMessages.add(lastMsg));
+            }
+          }
+        }
+      },
+      child: Positioned(
+        top: 100,
+        left: 0,
+        right: 0,
+        bottom: 240,
+        child: _localMessages.isEmpty
+            ? Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.45),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _isVisionModeEnabled
+                            ? Icons.camera_alt
+                            : _lastCapturedImage != null
+                            ? Icons.chat_bubble_outline
+                            : Icons.camera_alt_outlined,
+                        color: Colors.white70,
+                        size: 32,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _isVisionModeEnabled
+                            ? '📷 Vision mode ON\nNext message will capture NEW image'
+                            : _lastCapturedImage != null
+                            ? '💬 Follow-up mode\nAsking about previous image'
+                            : '📸 Point camera & tap mic\nto start analyzing',
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            : ListView.builder(
+                reverse: true,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                itemCount: _localMessages.length,
+                itemBuilder: (context, index) {
+                  final message =
+                      _localMessages[_localMessages.length - 1 - index];
+                  return _buildTransparentBubble(message);
+                },
+              ),
+      ),
+    );
+  }
+
+  Widget _buildTransparentBubble(MessageEntity message) {
+    final isUser = message.role == MessageRole.user;
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        mainAxisAlignment: isUser
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
+        children: [
+          if (!isUser)
+            Container(
+              margin: const EdgeInsets.only(right: 6),
+              child: CircleAvatar(
+                radius: 14,
+                backgroundColor: Colors.deepPurple.withOpacity(0.8),
+                child: const Icon(
+                  Icons.smart_toy,
+                  color: Colors.white,
+                  size: 14,
+                ),
+              ),
+            ),
+          Flexible(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: isUser
+                    ? Colors.deepPurple.withOpacity(0.75)
+                    : Colors.black.withOpacity(0.6),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: isUser
+                      ? Colors.deepPurple.shade200.withOpacity(0.4)
+                      : Colors.white24,
+                ),
+              ),
+              child: Text(
+                message.content,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  shadows: [Shadow(blurRadius: 2, color: Colors.black54)],
+                ),
+              ),
+            ),
+          ),
+          if (isUser)
+            Container(
+              margin: const EdgeInsets.only(left: 6),
+              child: CircleAvatar(
+                radius: 14,
+                backgroundColor: Colors.deepPurple.shade100.withOpacity(0.8),
+                child: const Icon(Icons.person, color: Colors.white, size: 14),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildVisionToggleButton() {
+    return Positioned(
+      bottom: 160,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: GestureDetector(
+          onTap: _toggleVisionMode,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 300),
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            decoration: BoxDecoration(
+              color: _isVisionModeEnabled
+                  ? Colors.green.withOpacity(0.9)
+                  : _lastCapturedImage != null
+                  ? Colors.blue.withOpacity(0.8)
+                  : Colors.black.withOpacity(0.6),
+              borderRadius: BorderRadius.circular(30),
+              border: Border.all(
+                color: _isVisionModeEnabled
+                    ? Colors.greenAccent
+                    : _lastCapturedImage != null
+                    ? Colors.blueAccent
+                    : Colors.white38,
+                width: 2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color:
+                      (_isVisionModeEnabled
+                              ? Colors.green
+                              : _lastCapturedImage != null
+                              ? Colors.blue
+                              : Colors.black)
+                          .withOpacity(0.5),
+                  blurRadius: 15,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  _isVisionModeEnabled
+                      ? Icons.camera_alt
+                      : _lastCapturedImage != null
+                      ? Icons.image
+                      : Icons.camera_alt_outlined,
+                  color: Colors.white,
+                  size: 24,
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  _isVisionModeEnabled
+                      ? 'Capture NEW'
+                      : _lastCapturedImage != null
+                      ? 'Follow-up Mode'
+                      : 'Vision OFF',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    shadows: [Shadow(blurRadius: 4, color: Colors.black54)],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomMicArea() {
+    return Positioned(
+      bottom: 0,
+      left: 0,
+      right: 0,
+      child: BlocConsumer<SpeechBloc, SpeechState>(
+        listener: (context, state) {
+          if (state is SpeechResult) {
+            _handleVoiceInput(state.text);
+          } else if (state is SpeechError) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(state.message)));
+          }
+        },
+        builder: (context, state) {
+          final isListening = state is SpeechListening;
+          final transcript = isListening ? state.transcript : '';
+
+          return Container(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.bottomCenter,
+                end: Alignment.topCenter,
+                colors: [Colors.black.withOpacity(0.85), Colors.transparent],
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                BlocBuilder<AIChatBloc, AIChatState>(
+                  builder: (context, chatState) {
+                    if (chatState is AIChatLoaded && chatState.isTyping) {
+                      return const Padding(
+                        padding: EdgeInsets.only(bottom: 8),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white70,
+                              ),
+                            ),
+                            SizedBox(width: 8),
+                            Text(
+                              'AI is analyzing...',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+                    return const SizedBox.shrink();
+                  },
+                ),
+
+                if (isListening && transcript.isNotEmpty)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.5),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white24),
+                    ),
+                    child: Text(
+                      transcript,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontStyle: FontStyle.italic,
+                        fontSize: 13,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+
+                GestureDetector(
+                  onTap: () {
+                    if (isListening) {
+                      context.read<SpeechBloc>().add(StopListeningEvent());
+                    } else {
+                      context.read<SpeechBloc>().add(StartListeningEvent());
+                    }
+                  },
+                  child: Container(
+                    width: 70,
+                    height: 70,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: isListening ? Colors.red : Colors.deepPurple,
+                      boxShadow: [
+                        BoxShadow(
+                          color: (isListening ? Colors.red : Colors.deepPurple)
+                              .withOpacity(0.5),
+                          blurRadius: 20,
+                          spreadRadius: 5,
+                        ),
+                      ],
+                    ),
+                    child: Icon(
+                      isListening ? Icons.stop : Icons.mic,
+                      color: Colors.white,
+                      size: 32,
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 8),
+
+                Text(
+                  isListening
+                      ? 'Listening... Tap to stop'
+                      : _isVisionModeEnabled
+                      ? 'Tap mic to capture & analyze'
+                      : _lastCapturedImage != null
+                      ? 'Tap mic to ask follow-up'
+                      : 'Tap mic to start',
+                  style: const TextStyle(color: Colors.white60, fontSize: 12),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import '../blocs/speech/speech_bloc.dart';
+import '../blocs/ai_chat/ai_chat_bloc.dart';
+import '../widgets/chat_bubble.dart';
+import '../widgets/mic_button.dart';
+import '../widgets/listening_indicator.dart';
+import 'camera_page.dart';
+import '../../../injection_container.dart';
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
+  late final AnimationController _pulseAnimation;
+  late final SpeechBloc _speechBloc;
+  late final AIChatBloc _aiChatBloc;
+  bool _hasLoadedHistory = false; // ✅ Prevent duplicate loading
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseAnimation = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    )..repeat(reverse: true);
+
+    _speechBloc = sl<SpeechBloc>();
+    _aiChatBloc = sl<AIChatBloc>();
+
+    // ✅ Only load history once on app start
+    if (!_hasLoadedHistory) {
+      _hasLoadedHistory = true;
+      _aiChatBloc.add(const LoadChatHistoryEvent());
+    }
+  }
+
+  @override
+  void dispose() {
+    _pulseAnimation.dispose();
+    super.dispose();
+  }
+
+  void _handleVoiceInput(String text) {
+    if (text.isNotEmpty) {
+      _aiChatBloc.add(SendMessageEvent(message: text));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiBlocProvider(
+      providers: [
+        BlocProvider.value(value: _speechBloc),
+        BlocProvider.value(value: _aiChatBloc),
+      ],
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('FL AI Assistant'),
+          backgroundColor: Colors.deepPurple,
+          foregroundColor: Colors.white,
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.camera_alt),
+              tooltip: 'AI Camera',
+              onPressed: () async {
+                // ✅ Navigate to camera
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const CameraPage()),
+                );
+                // ✅ Reload history when returning (to show camera messages)
+                if (mounted) {
+                  _aiChatBloc.add(const LoadChatHistoryEvent());
+                }
+              },
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_outline),
+              onPressed: () {
+                _aiChatBloc.add(const ClearChatHistoryEvent());
+              },
+            ),
+            IconButton(icon: const Icon(Icons.settings), onPressed: () {}),
+          ],
+        ),
+        body: BlocBuilder<AIChatBloc, AIChatState>(
+          builder: (context, chatState) {
+            return Column(
+              children: [
+                Expanded(
+                  child: BlocBuilder<AIChatBloc, AIChatState>(
+                    builder: (context, state) {
+                      if (state is AIChatLoading) {
+                        return const Center(child: CircularProgressIndicator());
+                      } else if (state is AIChatLoaded) {
+                        // ✅ Show empty state if no messages
+                        if (state.messages.isEmpty) {
+                          return Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.waving_hand,
+                                  size: 64,
+                                  color: Colors.deepPurple.withOpacity(0.5),
+                                ),
+                                const SizedBox(height: 16),
+                                Text(
+                                  'Tap mic & ask me anything!',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    color: Colors.grey[600],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }
+
+                        return ListView.builder(
+                          reverse: true,
+                          padding: const EdgeInsets.all(16),
+                          itemCount: state.messages.length,
+                          itemBuilder: (context, index) {
+                            final message = state
+                                .messages[state.messages.length - 1 - index];
+                            return ChatBubble(message: message);
+                          },
+                        );
+                      } else if (state is AIChatError) {
+                        return Center(child: Text('Error: ${state.message}'));
+                      }
+                      return const SizedBox.shrink();
+                    },
+                  ),
+                ),
+
+                if (chatState is AIChatLoaded && chatState.isTyping)
+                  const Padding(
+                    padding: EdgeInsets.all(8.0),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        SizedBox(width: 8),
+                        Text('AI is thinking...'),
+                      ],
+                    ),
+                  ),
+
+                BlocConsumer<SpeechBloc, SpeechState>(
+                  listener: (context, state) {
+                    if (state is SpeechResult) {
+                      _handleVoiceInput(state.text);
+                    } else if (state is SpeechError) {
+                      ScaffoldMessenger.of(
+                        context,
+                      ).showSnackBar(SnackBar(content: Text(state.message)));
+                    }
+                  },
+                  builder: (context, state) {
+                    String transcript = '';
+                    bool isListening = false;
+
+                    if (state is SpeechListening) {
+                      transcript = state.transcript;
+                      isListening = true;
+                    } else if (state is SpeechResult) {
+                      transcript = state.text;
+                    }
+
+                    return Column(
+                      children: [
+                        if (isListening)
+                          ListeningIndicator(transcript: transcript),
+                        Container(
+                          padding: const EdgeInsets.all(16),
+                          child: Column(
+                            children: [
+                              MicButton(
+                                isListening: isListening,
+                                onTap: () {
+                                  if (isListening) {
+                                    context.read<SpeechBloc>().add(
+                                      StopListeningEvent(),
+                                    );
+                                  } else {
+                                    context.read<SpeechBloc>().add(
+                                      StartListeningEvent(),
+                                    );
+                                  }
+                                },
+                                pulseAnimation: _pulseAnimation,
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                isListening
+                                    ? 'Listening... Tap to stop'
+                                    : 'Tap to speak',
+                                style: const TextStyle(color: Colors.grey),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+import 'package:flutter/material.dart';
+import '../../domain/entities/message_entity.dart';
+
+class ChatBubble extends StatelessWidget {
+  final MessageEntity message;
+
+  const ChatBubble({super.key, required this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    final isUser = message.role == MessageRole.user;
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        mainAxisAlignment: isUser
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
+        children: [
+          if (!isUser) _buildAvatar(Icons.smart_toy, Colors.deepPurple),
+          Flexible(
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: isUser ? Colors.deepPurple : Colors.grey.shade200,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Text(
+                message.content,
+                style: TextStyle(color: isUser ? Colors.white : Colors.black87),
+              ),
+            ),
+          ),
+          if (isUser) _buildAvatar(Icons.person, Colors.deepPurple.shade100),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAvatar(IconData icon, Color color) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 8),
+      child: CircleAvatar(
+        backgroundColor: color,
+        child: Icon(icon, color: Colors.white, size: 18),
+      ),
+    );
+  }
+}
+import 'package:flutter/material.dart';
+
+class ListeningIndicator extends StatelessWidget {
+  final String transcript;
+
+  const ListeningIndicator({super.key, required this.transcript});
+
+  @override
+  Widget build(BuildContext context) {
+    if (transcript.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      padding: const EdgeInsets.all(8),
+      margin: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Listening: $transcript',
+              style: const TextStyle(fontStyle: FontStyle.italic),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+import 'package:flutter/material.dart';
+
+class MicButton extends StatelessWidget {
+  final bool isListening;
+  final VoidCallback onTap;
+  final AnimationController? pulseAnimation;
+
+  const MicButton({
+    super.key,
+    required this.isListening,
+    required this.onTap,
+    this.pulseAnimation,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // If no animation is provided, use a dummy animation
+    final effectiveAnimation = pulseAnimation ?? _DummyAnimation();
+    
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedBuilder(
+        animation: effectiveAnimation,
+        builder: (context, child) {
+          return Container(
+            width: 80,
+            height: 80,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: isListening ? Colors.red : Colors.deepPurple,
+              boxShadow: isListening && pulseAnimation != null
+                  ? [
+                      BoxShadow(
+                        color: Colors.red.withOpacity(0.5),
+                        blurRadius: 20 * (pulseAnimation?.value ?? 1),
+                        spreadRadius: 5 * (pulseAnimation?.value ?? 1),
+                      ),
+                    ]
+                  : null,
+            ),
+            child: Icon(
+              isListening ? Icons.mic : Icons.mic_none,
+              color: Colors.white,
+              size: 40,
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+// Complete dummy animation class with correct method signatures
+class _DummyAnimation extends Animation<double> {
+  @override
+  void addListener(VoidCallback listener) {}
+
+  @override
+  void removeListener(VoidCallback listener) {}
+
+  @override
+  void addStatusListener(AnimationStatusListener listener) {}
+
+  @override
+  void removeStatusListener(AnimationStatusListener listener) {}
+
+  @override
+  double get value => 1.0;
+
+  @override
+  AnimationStatus get status => AnimationStatus.completed;
+
+  @override
+  Animation<U> drive<U>(Animatable<U> child) {
+    // Return a dummy animation of the requested type
+    return _DummyAnimationOfType<U>();
+  }
+
+  @override
+  String toStringDetails() {
+    return 'dummy';
+  }
+
+  @override
+  bool get isCompleted => true;
+
+  @override
+  bool get isDismissed => false;
+
+  @override
+  bool get isAnimating => false;
+}
+
+// Generic dummy animation for any type
+class _DummyAnimationOfType<T> extends Animation<T> {
+  @override
+  void addListener(VoidCallback listener) {}
+
+  @override
+  void removeListener(VoidCallback listener) {}
+
+  @override
+  void addStatusListener(AnimationStatusListener listener) {}
+
+  @override
+  void removeStatusListener(AnimationStatusListener listener) {}
+
+  @override
+  T get value => throw UnimplementedError('Dummy animation value should not be used');
+
+  @override
+  AnimationStatus get status => AnimationStatus.completed;
+
+  @override
+  Animation<U> drive<U>(Animatable<U> child) {
+    return _DummyAnimationOfType<U>();
+  }
+
+  @override
+  String toStringDetails() {
+    return 'dummy_of_type';
+  }
+
+  @override
+  bool get isCompleted => true;
+
+  @override
+  bool get isDismissed => false;
+
+  @override
+  bool get isAnimating => false;
+}
