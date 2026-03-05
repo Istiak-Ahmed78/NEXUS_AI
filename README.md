@@ -189,7 +189,7 @@ intl: ^0.19.0
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/yourusername/luminous.git
+git clone https://github.com/Istiak-Ahmed78/luminous.git
 cd luminous
 ```
 
