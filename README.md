@@ -190,7 +190,7 @@ intl: ^0.19.0
 1. **Clone the repository**
 ```bash
 git clone https://github.com/Istiak-Ahmed78/NEXUS_AI.git
-cd luminous
+cd NEXUS_AI
 ```
 
 2. **Install dependencies**
