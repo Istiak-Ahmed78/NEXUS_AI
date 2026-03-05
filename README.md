@@ -1,6 +1,7 @@
-<img width="1920" height="1080" alt="Set an aralm at 4PM (3)" src="https://github.com/user-attachments/assets/3d995f2d-6687-4870-b6fe-c33e61db3ade" />
+<img width="1920" height="1080" alt="Set an aralm at 4PM (3)" src="https://github.com/user-attachments/assets/fee5fabb-f35d-4255-80db-fa923409815b" />
 
 # 🎯 NEXUS - AI Vision Chat App
+
 > **Intelligent conversational AI with real-time image analysis, web search integration, and voice interaction**
 
 ![Flutter](https://img.shields.io/badge/Flutter-3.41.2-blue?logo=flutter)
