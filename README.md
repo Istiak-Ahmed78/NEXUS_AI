@@ -217,10 +217,3 @@ flutter run
 MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
-
-
-print("\n" + "="*80)
-print(f"📊 Total length: {len(readme_content)} characters (vs 11,321 before)")
-print(f"📉 Reduced by: {((11321 - len(readme_content)) / 11321 * 100):.1f}%")
-print("📁 Saved to: /home/user/README_SHORT.md")
-
