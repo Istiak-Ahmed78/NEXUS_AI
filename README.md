@@ -218,21 +218,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
-## 👨‍💻 Author
-
-**Your Name**
-- GitHub: [@yourusername](https://github.com/yourusername)
-- Email: your.email@example.com
-
----
-
-<div align="center">
-
-**Made with ❤️ by [Your Name]**
-
-[⬆ back to top](#-luminous---ai-vision-chat-app)
-
-</div>
 
 print("\n" + "="*80)
 print(f"📊 Total length: {len(readme_content)} characters (vs 11,321 before)")
