@@ -24,9 +24,9 @@
 
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/cd7e17c7-4969-4dfe-8f77-b073e73a5572" width="280"/>
-  <img src="https://github.com/user-attachments/assets/8d576f06-c5a5-4084-a5ef-509411559a5b" width="280"/>
-  <img src="https://github.com/user-attachments/assets/2cb02084-de9b-47d2-8393-005260190726" width="280"/>
+  <img src="https://github.com/user-attachments/assets/cd7e17c7-4969-4dfe-8f77-b073e73a5572" width="310"/>
+  <img src="https://github.com/user-attachments/assets/8d576f06-c5a5-4084-a5ef-509411559a5b" width="310"/>
+  <!-- <img src="https://github.com/user-attachments/assets/2cb02084-de9b-47d2-8393-005260190726" width="280"/> -->
 </p>
 
 ## ✨ Key Features
