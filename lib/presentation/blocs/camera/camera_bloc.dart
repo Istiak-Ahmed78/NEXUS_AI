@@ -121,7 +121,6 @@ class CameraBloc extends Bloc<CameraEvent, CameraState> {
     emit(CameraInitial());
   }
 
-  /// ✅ Optimized initialization
   Future<void> _initController(CameraDescription camera) async {
     _controller = CameraController(
       camera,

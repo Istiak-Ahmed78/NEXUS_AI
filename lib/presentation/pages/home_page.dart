@@ -19,7 +19,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   late final AnimationController _pulseAnimation;
   late final SpeechBloc _speechBloc;
   late final AIChatBloc _aiChatBloc;
-  bool _hasLoadedHistory = false; // ✅ Prevent duplicate loading
+  bool _hasLoadedHistory = false;
 
   @override
   void initState() {
@@ -32,7 +32,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _speechBloc = sl<SpeechBloc>();
     _aiChatBloc = sl<AIChatBloc>();
 
-    // ✅ Only load history once on app start
     if (!_hasLoadedHistory) {
       _hasLoadedHistory = true;
       _aiChatBloc.add(const LoadChatHistoryEvent());
@@ -68,12 +67,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               icon: const Icon(Icons.camera_alt),
               tooltip: 'AI Camera',
               onPressed: () async {
-                // ✅ Navigate to camera
                 await Navigator.push(
                   context,
                   MaterialPageRoute(builder: (_) => const CameraPage()),
                 );
-                // ✅ Reload history when returning (to show camera messages)
                 if (mounted) {
                   _aiChatBloc.add(const LoadChatHistoryEvent());
                 }
@@ -98,7 +95,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                       if (state is AIChatLoading) {
                         return const Center(child: CircularProgressIndicator());
                       } else if (state is AIChatLoaded) {
-                        // ✅ Show empty state if no messages
                         if (state.messages.isEmpty) {
                           return Center(
                             child: Column(

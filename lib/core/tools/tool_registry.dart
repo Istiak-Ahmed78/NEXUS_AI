@@ -7,7 +7,6 @@ class ToolRegistry {
     return [
       Tool(
         functionDeclarations: [
-          // ── 🌤️ WEATHER ──────────────────────────────
           FunctionDeclaration(
             'get_weather',
             'Get current temperature and weather condition at a location',
@@ -23,7 +22,6 @@ class ToolRegistry {
             ),
           ),
 
-          // ── ⏰ ALARM ─────────────────────────────────
           FunctionDeclaration(
             'set_alarm',
             'Set an alarm or reminder at a specific time',
@@ -43,7 +41,6 @@ class ToolRegistry {
             ),
           ),
 
-          // ── 📞 CALL BY CONTACT NAME ──────────────────
           FunctionDeclaration(
             'make_call',
             'Make a phone call to a saved contact by their name',
@@ -59,7 +56,6 @@ class ToolRegistry {
             ),
           ),
 
-          // ── 📞 CALL BY PHONE NUMBER ──────────────────  ✅ NEW
           FunctionDeclaration(
             'phone_call',
             'Make a phone call to a specific phone number directly (not from contacts)',
@@ -76,7 +72,6 @@ class ToolRegistry {
             ),
           ),
 
-          // ── 🔦 FLASHLIGHT ────────────────────────────
           FunctionDeclaration(
             'toggle_flashlight',
             'Turn the device flashlight on or off',
@@ -89,7 +84,6 @@ class ToolRegistry {
             ),
           ),
 
-          // ── 🌐 WEB SEARCH ────────────────────────────
           FunctionDeclaration(
             'open_web_search',
             'Open a web search for a given query in the browser',
