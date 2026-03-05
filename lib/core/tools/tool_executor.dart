@@ -16,7 +16,6 @@ class ToolExecutor {
   static final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
 
-  // ── Initialize notifications once at app start ──
   static Future<void> init() async {
     tz.initializeTimeZones();
 
@@ -34,13 +33,10 @@ class ToolExecutor {
     );
   }
 
-  // ── Main dispatcher ──────────────────────────────
   static Future<Map<String, dynamic>> execute(
     String toolName,
     Map<String, dynamic> args,
   ) async {
-    print('🔧 Executing tool: $toolName with args: $args');
-
     switch (toolName) {
       case 'get_weather':
         return await _getWeather(args['location'] as String);
@@ -54,7 +50,7 @@ class ToolExecutor {
       case 'make_call':
         return await _makeCall(args['contact_name'] as String);
 
-      case 'phone_call': // ✅ NEW
+      case 'phone_call':
         return await _phoneCall(args['phone_number'] as String);
 
       case 'toggle_flashlight':
@@ -74,7 +70,6 @@ class ToolExecutor {
     }
   }
 
-  // ── 🌤️ WEATHER ───────────────────────────────────
   static Future<Map<String, dynamic>> _getWeather(String location) async {
     try {
       final apiKey = AppConstants.openWeatherApiKey;
@@ -102,7 +97,6 @@ class ToolExecutor {
     }
   }
 
-  // ── ⏰ ALARM ──────────────────────────────────────
   static Future<Map<String, dynamic>> _setAlarm(
     String time,
     String label,
@@ -150,20 +144,12 @@ class ToolExecutor {
     }
   }
 
-  // ── 📞 CALL BY CONTACT NAME ───────────────────────
   static Future<Map<String, dynamic>> _makeCall(String contactName) async {
     try {
-      print('📞 [Call] Starting call to: "$contactName"');
-
-      // ── Step 1: Check permanent denial first ─────
       final contactsStatus = await Permission.contacts.status;
       final phoneStatus = await Permission.phone.status;
 
-      print('📞 [Call] Contacts permission: $contactsStatus');
-      print('📞 [Call] Phone permission   : $phoneStatus');
-
       if (contactsStatus.isPermanentlyDenied) {
-        print('❌ [Call] Contacts permanently denied → opening settings');
         await openAppSettings();
         return {
           'success': false,
@@ -174,7 +160,6 @@ class ToolExecutor {
       }
 
       if (phoneStatus.isPermanentlyDenied) {
-        print('❌ [Call] Phone permanently denied → opening settings');
         await openAppSettings();
         return {
           'success': false,
@@ -184,14 +169,10 @@ class ToolExecutor {
         };
       }
 
-      // ── Step 2: Request permissions SEPARATELY ────
       if (!contactsStatus.isGranted) {
-        print('📞 [Call] Requesting contacts permission...');
         final contactsResult = await Permission.contacts.request();
-        print('📞 [Call] Contacts result: $contactsResult');
 
         if (!contactsResult.isGranted) {
-          print('❌ [Call] Contacts permission denied');
           return {
             'success': false,
             'error':
@@ -202,12 +183,9 @@ class ToolExecutor {
       }
 
       if (!phoneStatus.isGranted) {
-        print('📞 [Call] Requesting phone permission...');
         final phoneResult = await Permission.phone.request();
-        print('📞 [Call] Phone result: $phoneResult');
 
         if (!phoneResult.isGranted) {
-          print('❌ [Call] Phone permission denied');
           return {
             'success': false,
             'error':
@@ -217,17 +195,12 @@ class ToolExecutor {
         }
       }
 
-      print('✅ [Call] Both permissions granted');
-
-      // ── Step 3: Load contacts ─────────────────────
       final contacts = await FlutterContacts.getContacts(withProperties: true);
-      print('📞 [Call] Total contacts loaded: ${contacts.length}');
 
       if (contacts.isEmpty) {
         return {'success': false, 'error': 'No contacts found on this device.'};
       }
 
-      // ── Step 4: Find best match ───────────────────
       Contact? match;
 
       try {
@@ -236,7 +209,6 @@ class ToolExecutor {
               c.displayName.toLowerCase().trim() ==
               contactName.toLowerCase().trim(),
         );
-        print('✅ [Call] Exact match: ${match.displayName}');
       } catch (_) {
         match = null;
       }
@@ -248,15 +220,12 @@ class ToolExecutor {
               contactName.toLowerCase().trim(),
             ),
           );
-          print('✅ [Call] Partial match: ${match.displayName}');
         } catch (_) {
           match = null;
         }
       }
 
-      // ── Step 5: Validate match ────────────────────
       if (match == null || match.id.isEmpty) {
-        print('❌ [Call] No contact found for "$contactName"');
         return {
           'success': false,
           'error':
@@ -266,23 +235,18 @@ class ToolExecutor {
       }
 
       if (match.phones.isEmpty) {
-        print('❌ [Call] No phone number for: ${match.displayName}');
         return {
           'success': false,
           'error': '${match.displayName} has no phone number saved.',
         };
       }
 
-      // ── Step 6: Dial ──────────────────────────────
       final rawNumber = match.phones.first.number;
       final phoneNumber = rawNumber.replaceAll(RegExp(r'[\s\-\(\)]'), '');
       final uri = Uri.parse('tel:$phoneNumber');
 
-      print('📞 [Call] Dialing: ${match.displayName} → $phoneNumber');
-
       if (await canLaunchUrl(uri)) {
         await launchUrl(uri);
-        print('✅ [Call] Call launched successfully');
         return {
           'success': true,
           'message': 'Calling ${match.displayName}',
@@ -291,13 +255,11 @@ class ToolExecutor {
         };
       }
 
-      print('❌ [Call] Cannot launch dialer');
       return {
         'success': false,
         'error': 'Cannot open the phone dialer on this device.',
       };
     } catch (e) {
-      print('❌ [Call] Unexpected error: $e');
       return {
         'success': false,
         'error': 'Failed to make call: ${e.toString()}',
@@ -305,17 +267,11 @@ class ToolExecutor {
     }
   }
 
-  // ── 📞 CALL BY PHONE NUMBER ───────────────────────  ✅ NEW
   static Future<Map<String, dynamic>> _phoneCall(String phoneNumber) async {
     try {
-      print('📞 [DirectCall] Calling number: "$phoneNumber"');
-
-      // ── Step 1: Check phone permission ────────────
       final phoneStatus = await Permission.phone.status;
-      print('📞 [DirectCall] Phone permission: $phoneStatus');
 
       if (phoneStatus.isPermanentlyDenied) {
-        print('❌ [DirectCall] Phone permanently denied → opening settings');
         await openAppSettings();
         return {
           'success': false,
@@ -326,12 +282,9 @@ class ToolExecutor {
       }
 
       if (!phoneStatus.isGranted) {
-        print('📞 [DirectCall] Requesting phone permission...');
         final phoneResult = await Permission.phone.request();
-        print('📞 [DirectCall] Phone result: $phoneResult');
 
         if (!phoneResult.isGranted) {
-          print('❌ [DirectCall] Phone permission denied');
           return {
             'success': false,
             'error':
@@ -341,29 +294,19 @@ class ToolExecutor {
         }
       }
 
-      print('✅ [DirectCall] Phone permission granted');
-
-      // ── Step 2: Clean and validate number ─────────
-      // Remove spaces, dashes, parentheses
       final cleanNumber = phoneNumber.replaceAll(RegExp(r'[\s\-\(\)]'), '');
 
-      // Basic validation (at least 3 digits)
       if (cleanNumber.length < 3) {
-        print('❌ [DirectCall] Invalid number: "$phoneNumber"');
         return {
           'success': false,
           'error': 'Invalid phone number: "$phoneNumber"',
         };
       }
 
-      print('📞 [DirectCall] Cleaned number: $cleanNumber');
-
-      // ── Step 3: Launch dialer ─────────────────────
       final uri = Uri.parse('tel:$cleanNumber');
 
       if (await canLaunchUrl(uri)) {
         await launchUrl(uri);
-        print('✅ [DirectCall] Call launched successfully');
         return {
           'success': true,
           'message': 'Calling $cleanNumber',
@@ -371,13 +314,11 @@ class ToolExecutor {
         };
       }
 
-      print('❌ [DirectCall] Cannot launch dialer');
       return {
         'success': false,
         'error': 'Cannot open the phone dialer on this device.',
       };
     } catch (e) {
-      print('❌ [DirectCall] Unexpected error: $e');
       return {
         'success': false,
         'error': 'Failed to make call: ${e.toString()}',
@@ -385,77 +326,59 @@ class ToolExecutor {
     }
   }
 
-  // ── 🔦 FLASHLIGHT ─────────────────────────────────
   static Future<Map<String, dynamic>> _toggleFlashlight(String state) async {
     try {
       final turnOn = state.toLowerCase() == 'on';
 
       final hasTorch = await TorchLight.isTorchAvailable();
       if (!hasTorch) {
-        print('❌ [Flashlight] No torch on this device');
         return {'success': false, 'error': 'This device has no flashlight'};
       }
 
       if (turnOn) {
         await TorchLight.enableTorch();
-        print('✅ [Flashlight] Turned ON');
       } else {
         await TorchLight.disableTorch();
-        print('✅ [Flashlight] Turned OFF');
       }
 
       return {'success': true, 'state': state};
     } on EnableTorchExistentUserException catch (_) {
-      print('❌ [Flashlight] Camera in use — cannot enable torch');
       return {'success': false, 'error': 'Camera is in use by another app'};
     } on EnableTorchNotAvailableException catch (_) {
-      print('❌ [Flashlight] Torch not available on this device');
       return {'success': false, 'error': 'Torch not available'};
     } on EnableTorchException catch (e) {
-      print('❌ [Flashlight] Enable error: $e');
       return {'success': false, 'error': 'Could not enable flashlight'};
     } on DisableTorchExistentUserException catch (_) {
-      print('❌ [Flashlight] Camera in use — cannot disable torch');
       return {'success': false, 'error': 'Camera is in use by another app'};
     } on DisableTorchNotAvailableException catch (_) {
-      print('❌ [Flashlight] Torch not available on this device');
       return {'success': false, 'error': 'Torch not available'};
     } on DisableTorchException catch (e) {
-      print('❌ [Flashlight] Disable error: $e');
       return {'success': false, 'error': 'Could not disable flashlight'};
     } catch (e) {
-      print('❌ [Flashlight] Unexpected: $e');
       return {'success': false, 'error': e.toString()};
     }
   }
 
-  // ── 🌐 WEB SEARCH ─────────────────────────────────
   static Future<Map<String, dynamic>> _openWebSearch(String query) async {
     try {
       final uri = Uri.https('www.google.com', '/search', {'q': query});
-      print('🌐 [Search] Launching: $uri');
 
       if (await canLaunchUrl(uri)) {
         await launchUrl(uri, mode: LaunchMode.externalApplication);
-        print('✅ [Search] Opened: $query');
         return {'success': true, 'query': query};
       }
 
       final fallback = await launchUrl(uri, mode: LaunchMode.platformDefault);
       if (fallback) {
-        print('✅ [Search] Opened via fallback: $query');
         return {'success': true, 'query': query};
       }
 
-      print('❌ [Search] Cannot open browser');
       return {'success': false, 'error': 'Cannot open browser'};
     } catch (e) {
-      print('❌ [Search] Error: $e');
       return {'success': false, 'error': e.toString()};
     }
   }
 
-  // ── 🕐 TIME ───────────────────────────────────────
   static Map<String, dynamic> _getTime() {
     try {
       final now = DateTime.now();
@@ -468,8 +391,6 @@ class ToolExecutor {
           'UTC${offsetHours >= 0 ? '+' : ''}$offsetHours'
           '${offsetMins > 0 ? ':$offsetMins' : ''}';
 
-      print('✅ [Time] $time12h ($timezone / $offsetStr)');
-
       return {
         'success': true,
         'time_12h': time12h,
@@ -479,12 +400,10 @@ class ToolExecutor {
         'timestamp': now.millisecondsSinceEpoch,
       };
     } catch (e) {
-      print('❌ [Time] Error: $e');
       return {'success': false, 'error': e.toString()};
     }
   }
 
-  // ── 📅 DATE ───────────────────────────────────────
   static Map<String, dynamic> _getDate() {
     try {
       final now = DateTime.now();
@@ -493,8 +412,6 @@ class ToolExecutor {
       final dateIso = DateFormat('yyyy-MM-dd').format(now);
       final dayOfWeek = DateFormat('EEEE').format(now);
       final month = DateFormat('MMMM').format(now);
-
-      print('✅ [Date] $dateFull');
 
       return {
         'success': true,
@@ -507,7 +424,6 @@ class ToolExecutor {
         'year': now.year,
       };
     } catch (e) {
-      print('❌ [Date] Error: $e');
       return {'success': false, 'error': e.toString()};
     }
   }

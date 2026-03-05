@@ -24,7 +24,6 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
 
   final List<MessageEntity> _localMessages = [];
 
-  // ✅ Store last captured image for follow-ups
   File? _lastCapturedImage;
   bool _isVisionModeEnabled = false;
   String? _pendingVoiceInput;
@@ -57,24 +56,10 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     setState(() {
       _isVisionModeEnabled = !_isVisionModeEnabled;
     });
-
-    if (_isVisionModeEnabled) {
-      print('🟢 [Camera] Vision mode ENABLED - will capture NEW image');
-    } else {
-      print(
-        '⚪ [Camera] Vision mode DISABLED - will use last image for follow-ups',
-      );
-    }
   }
 
   Future<void> _handleVoiceInput(String text) async {
     if (text.isEmpty) return;
-
-    print('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    print('🎤 [Camera] Voice input: "$text"');
-    print('📷 [Camera] Vision mode: $_isVisionModeEnabled');
-    print('💾 [Camera] Last image: ${_lastCapturedImage?.path ?? "NONE"}');
-    print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
     final userMessage = MessageModel.create(
       content: text,
@@ -83,29 +68,17 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     setState(() => _localMessages.add(userMessage));
 
     if (_isVisionModeEnabled) {
-      // ✅ Capture NEW image
-      print('📸 [Camera] Capturing NEW image for: "$text"');
       _pendingVoiceInput = text;
       _cameraBloc.add(CapturePhotoEvent());
     } else if (_lastCapturedImage != null) {
-      // ✅ Use LAST captured image for follow-up
-      print('🔄 [Camera] Using LAST image for follow-up: "$text"');
-      print('   🖼️  Image: ${_lastCapturedImage!.path}');
       _sendVisionMessage(text, _lastCapturedImage!);
     } else {
-      // ⚠️ No image yet - force capture
-      print('⚠️  [Camera] No image captured yet, forcing capture...');
       _pendingVoiceInput = text;
       _cameraBloc.add(CapturePhotoEvent());
     }
   }
 
   Future<void> _sendVisionMessage(String text, File imageFile) async {
-    print('\n✅ [Camera] Sending VISION message:');
-    print('   📝 Text: "$text"');
-    print('   🖼️  Image: ${imageFile.path}');
-    print('   📦 Event: SendMessageWithImageEvent\n');
-
     _aiChatBloc.add(
       SendMessageWithImageEvent(
         message: text,
@@ -114,15 +87,12 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
       ),
     );
 
-    // ✅ Store image and reset vision mode
     if (_isVisionModeEnabled) {
       setState(() {
         _lastCapturedImage = imageFile;
         _isVisionModeEnabled = false;
         _pendingVoiceInput = null;
       });
-      print('💾 [Camera] Stored image for follow-ups');
-      print('🔄 [Camera] Vision mode auto-reset to OFF\n');
     }
   }
 
@@ -153,7 +123,6 @@ class _CameraPageState extends State<CameraPage> with TickerProviderStateMixin {
     return BlocConsumer<CameraBloc, CameraState>(
       listener: (context, state) {
         if (state is CameraPhotoCaptured) {
-          print('📷 [Camera] Photo captured: ${state.imageFile.path}');
           if (_pendingVoiceInput != null) {
             _sendVisionMessage(_pendingVoiceInput!, state.imageFile);
           }

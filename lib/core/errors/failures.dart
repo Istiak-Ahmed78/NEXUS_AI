@@ -10,17 +10,17 @@ abstract class Failure extends Equatable {
 }
 
 class ServerFailure extends Failure {
-  const ServerFailure(String message) : super(message);
+  const ServerFailure(super.message);
 }
 
 class SpeechRecognitionFailure extends Failure {
-  const SpeechRecognitionFailure(String message) : super(message);
+  const SpeechRecognitionFailure(super.message);
 }
 
 class TTSFailure extends Failure {
-  const TTSFailure(String message) : super(message);
+  const TTSFailure(super.message);
 }
 
 class PermissionFailure extends Failure {
-  const PermissionFailure(String message) : super(message);
+  const PermissionFailure(super.message);
 }
