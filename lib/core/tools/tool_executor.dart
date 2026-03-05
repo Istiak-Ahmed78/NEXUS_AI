@@ -5,7 +5,7 @@ import 'package:fl_ai/core/constants/app_constants.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
-import 'package:intl/intl.dart'; // ✅ NEW
+import 'package:intl/intl.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:timezone/data/latest.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
@@ -54,16 +54,19 @@ class ToolExecutor {
       case 'make_call':
         return await _makeCall(args['contact_name'] as String);
 
+      case 'phone_call': // ✅ NEW
+        return await _phoneCall(args['phone_number'] as String);
+
       case 'toggle_flashlight':
         return await _toggleFlashlight(args['state'] as String);
 
       case 'open_web_search':
         return await _openWebSearch(args['query'] as String);
 
-      case 'get_time': // ✅ NEW
+      case 'get_time':
         return _getTime();
 
-      case 'get_date': // ✅ NEW
+      case 'get_date':
         return _getDate();
 
       default:
@@ -147,7 +150,7 @@ class ToolExecutor {
     }
   }
 
-  // ── 📞 CALL ───────────────────────────────────────
+  // ── 📞 CALL BY CONTACT NAME ───────────────────────
   static Future<Map<String, dynamic>> _makeCall(String contactName) async {
     try {
       print('📞 [Call] Starting call to: "$contactName"');
@@ -182,7 +185,6 @@ class ToolExecutor {
       }
 
       // ── Step 2: Request permissions SEPARATELY ────
-      // Request contacts permission first
       if (!contactsStatus.isGranted) {
         print('📞 [Call] Requesting contacts permission...');
         final contactsResult = await Permission.contacts.request();
@@ -199,7 +201,6 @@ class ToolExecutor {
         }
       }
 
-      // Request phone permission separately
       if (!phoneStatus.isGranted) {
         print('📞 [Call] Requesting phone permission...');
         final phoneResult = await Permission.phone.request();
@@ -229,7 +230,6 @@ class ToolExecutor {
       // ── Step 4: Find best match ───────────────────
       Contact? match;
 
-      // Exact match first (case-insensitive)
       try {
         match = contacts.firstWhere(
           (c) =>
@@ -241,7 +241,6 @@ class ToolExecutor {
         match = null;
       }
 
-      // Partial match if no exact match
       if (match == null || match.id.isEmpty) {
         try {
           match = contacts.firstWhere(
@@ -299,6 +298,86 @@ class ToolExecutor {
       };
     } catch (e) {
       print('❌ [Call] Unexpected error: $e');
+      return {
+        'success': false,
+        'error': 'Failed to make call: ${e.toString()}',
+      };
+    }
+  }
+
+  // ── 📞 CALL BY PHONE NUMBER ───────────────────────  ✅ NEW
+  static Future<Map<String, dynamic>> _phoneCall(String phoneNumber) async {
+    try {
+      print('📞 [DirectCall] Calling number: "$phoneNumber"');
+
+      // ── Step 1: Check phone permission ────────────
+      final phoneStatus = await Permission.phone.status;
+      print('📞 [DirectCall] Phone permission: $phoneStatus');
+
+      if (phoneStatus.isPermanentlyDenied) {
+        print('❌ [DirectCall] Phone permanently denied → opening settings');
+        await openAppSettings();
+        return {
+          'success': false,
+          'error':
+              'Phone permission permanently denied. '
+              'Please enable it in Settings.',
+        };
+      }
+
+      if (!phoneStatus.isGranted) {
+        print('📞 [DirectCall] Requesting phone permission...');
+        final phoneResult = await Permission.phone.request();
+        print('📞 [DirectCall] Phone result: $phoneResult');
+
+        if (!phoneResult.isGranted) {
+          print('❌ [DirectCall] Phone permission denied');
+          return {
+            'success': false,
+            'error':
+                'Phone call permission denied. '
+                'Please allow phone access to make calls.',
+          };
+        }
+      }
+
+      print('✅ [DirectCall] Phone permission granted');
+
+      // ── Step 2: Clean and validate number ─────────
+      // Remove spaces, dashes, parentheses
+      final cleanNumber = phoneNumber.replaceAll(RegExp(r'[\s\-\(\)]'), '');
+
+      // Basic validation (at least 3 digits)
+      if (cleanNumber.length < 3) {
+        print('❌ [DirectCall] Invalid number: "$phoneNumber"');
+        return {
+          'success': false,
+          'error': 'Invalid phone number: "$phoneNumber"',
+        };
+      }
+
+      print('📞 [DirectCall] Cleaned number: $cleanNumber');
+
+      // ── Step 3: Launch dialer ─────────────────────
+      final uri = Uri.parse('tel:$cleanNumber');
+
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri);
+        print('✅ [DirectCall] Call launched successfully');
+        return {
+          'success': true,
+          'message': 'Calling $cleanNumber',
+          'number': cleanNumber,
+        };
+      }
+
+      print('❌ [DirectCall] Cannot launch dialer');
+      return {
+        'success': false,
+        'error': 'Cannot open the phone dialer on this device.',
+      };
+    } catch (e) {
+      print('❌ [DirectCall] Unexpected error: $e');
       return {
         'success': false,
         'error': 'Failed to make call: ${e.toString()}',
@@ -376,13 +455,13 @@ class ToolExecutor {
     }
   }
 
-  // ── 🕐 TIME ───────────────────────────────────────  ✅ NEW
+  // ── 🕐 TIME ───────────────────────────────────────
   static Map<String, dynamic> _getTime() {
     try {
       final now = DateTime.now();
-      final time12h = DateFormat('hh:mm:ss a').format(now); // 09:45:30 PM
-      final time24h = DateFormat('HH:mm:ss').format(now); // 21:45:30
-      final timezone = now.timeZoneName; // BDT / UTC+6
+      final time12h = DateFormat('hh:mm:ss a').format(now);
+      final time24h = DateFormat('HH:mm:ss').format(now);
+      final timezone = now.timeZoneName;
       final offsetHours = now.timeZoneOffset.inHours;
       final offsetMins = now.timeZoneOffset.inMinutes.abs() % 60;
       final offsetStr =
@@ -393,10 +472,10 @@ class ToolExecutor {
 
       return {
         'success': true,
-        'time_12h': time12h, // "09:45:30 PM"
-        'time_24h': time24h, // "21:45:30"
-        'timezone': timezone, // "BDT"
-        'utc_offset': offsetStr, // "UTC+6"
+        'time_12h': time12h,
+        'time_24h': time24h,
+        'timezone': timezone,
+        'utc_offset': offsetStr,
         'timestamp': now.millisecondsSinceEpoch,
       };
     } catch (e) {
@@ -405,29 +484,27 @@ class ToolExecutor {
     }
   }
 
-  // ── 📅 DATE ───────────────────────────────────────  ✅ NEW
+  // ── 📅 DATE ───────────────────────────────────────
   static Map<String, dynamic> _getDate() {
     try {
       final now = DateTime.now();
-      final dateFull = DateFormat(
-        'EEEE, MMMM d, y',
-      ).format(now); // Friday, February 28, 2026
-      final dateShort = DateFormat('dd/MM/yyyy').format(now); // 28/02/2026
-      final dateIso = DateFormat('yyyy-MM-dd').format(now); // 2026-02-28
-      final dayOfWeek = DateFormat('EEEE').format(now); // Friday
-      final month = DateFormat('MMMM').format(now); // February
+      final dateFull = DateFormat('EEEE, MMMM d, y').format(now);
+      final dateShort = DateFormat('dd/MM/yyyy').format(now);
+      final dateIso = DateFormat('yyyy-MM-dd').format(now);
+      final dayOfWeek = DateFormat('EEEE').format(now);
+      final month = DateFormat('MMMM').format(now);
 
       print('✅ [Date] $dateFull');
 
       return {
         'success': true,
-        'date_full': dateFull, // "Friday, February 28, 2026"
-        'date_short': dateShort, // "28/02/2026"
-        'date_iso': dateIso, // "2026-02-28"
-        'day_of_week': dayOfWeek, // "Friday"
-        'month': month, // "February"
-        'day': now.day, // 28
-        'year': now.year, // 2026
+        'date_full': dateFull,
+        'date_short': dateShort,
+        'date_iso': dateIso,
+        'day_of_week': dayOfWeek,
+        'month': month,
+        'day': now.day,
+        'year': now.year,
       };
     } catch (e) {
       print('❌ [Date] Error: $e');

@@ -43,10 +43,10 @@ class ToolRegistry {
             ),
           ),
 
-          // ── 📞 CALL ──────────────────────────────────
+          // ── 📞 CALL BY CONTACT NAME ──────────────────
           FunctionDeclaration(
             'make_call',
-            'Make a phone call to a contact by their name',
+            'Make a phone call to a saved contact by their name',
             Schema(
               SchemaType.object,
               properties: {
@@ -56,6 +56,23 @@ class ToolRegistry {
                 ),
               },
               requiredProperties: ['contact_name'],
+            ),
+          ),
+
+          // ── 📞 CALL BY PHONE NUMBER ──────────────────  ✅ NEW
+          FunctionDeclaration(
+            'phone_call',
+            'Make a phone call to a specific phone number directly (not from contacts)',
+            Schema(
+              SchemaType.object,
+              properties: {
+                'phone_number': Schema(
+                  SchemaType.string,
+                  description:
+                      'Phone number to call, e.g. +8801712345678 or 555-1234',
+                ),
+              },
+              requiredProperties: ['phone_number'],
             ),
           ),
 
